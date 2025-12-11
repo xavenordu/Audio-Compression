@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-fractal_wav_compressor_gpu.py
-Upgraded fractal compressor for WAV files with GPU support and memory mapping.
+fractal_wav_compressor_gpu_cli.py
+Upgraded fractal compressor/decompressor for WAV files with GPU support, memory mapping, and convergence-based iterative decoding.
+Provides CLI and Python API.
 """
 
 import argparse
@@ -28,7 +29,7 @@ def read_wav_mono(path, mmap=False):
         nframes = w.getnframes()
         if mmap:
             dtype = np.uint8 if sampwidth==1 else np.int16
-            data = np.memmap(path, dtype=dtype, mode='r', offset=44)  # skip WAV header
+            data = np.memmap(path, dtype=dtype, mode='r', offset=44)
         else:
             raw = w.readframes(nframes)
             fmt = np.uint8 if sampwidth==1 else np.int16
@@ -47,7 +48,6 @@ def write_wav(path, data, framerate, sampwidth):
         out = data.clip(-32768, 32767).astype(np.int16)
     else:
         raise ValueError('Unsupported sample width')
-
     with wave.open(path, 'wb') as w:
         w.setnchannels(1)
         w.setsampwidth(sampwidth)
@@ -65,10 +65,8 @@ def frame_ranges(signal, range_size, hop=None):
 
 def build_domain_pool(signal, tile_size, range_size, domain_step=1, block_size=1000, use_gpu=False):
     n = len(signal)
-    domains = []
-    starts = list(range(0, n-tile_size+1, domain_step))
     xp = cp if use_gpu else np
-
+    starts = list(range(0, n-tile_size+1, domain_step))
     for i in range(0, len(starts), block_size):
         batch = starts[i:i+block_size]
         block_domains = []
@@ -152,6 +150,36 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
     return matches, domains_array, ranges.shape[0], range_size
 
 
+def save_compressed(filepath, matches, domains_array, range_size, framerate, sampwidth):
+    with open(filepath, 'wb') as f:
+        f.write(b'FWAV')
+        f.write(struct.pack('<I', range_size))
+        f.write(struct.pack('<I', framerate))
+        f.write(struct.pack('<B', sampwidth))
+        n_domains = len(domains_array)
+        n_ranges = len(matches)
+        f.write(struct.pack('<I', n_ranges))
+        f.write(struct.pack('<I', n_domains))
+        for d in domains_array:
+            f.write(struct.pack('<'+'f'*len(d), *d.tolist()))
+        for m in matches:
+            f.write(struct.pack('<IffB', m[0], m[1], m[2], m[3]))
+
+
+def load_compressed(filepath):
+    with open(filepath, 'rb') as f:
+        if f.read(4) != b'FWAV':
+            raise ValueError('Not a FWAV file')
+        range_size = struct.unpack('<I', f.read(4))[0]
+        framerate = struct.unpack('<I', f.read(4))[0]
+        sampwidth = struct.unpack('<B', f.read(1))[0]
+        n_ranges = struct.unpack('<I', f.read(4))[0]
+        n_domains = struct.unpack('<I', f.read(4))[0]
+        domains = [np.array(struct.unpack('<'+'f'*range_size, f.read(4*range_size)), dtype=np.float32) for _ in range(n_domains)]
+        matches = [struct.unpack('<IffB', f.read(13)) for _ in range(n_ranges)]
+    return matches, np.vstack(domains), n_ranges, range_size, framerate, sampwidth
+
+
 def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8, convergence_eps=1e-3, use_gpu=False):
     xp = cp if use_gpu else np
     recon_len = n_ranges*range_size
@@ -173,3 +201,45 @@ def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8,
         if delta < convergence_eps:
             break
     return recon
+
+# ----------------------- CLI -----------------------
+
+def main():
+    parser = argparse.ArgumentParser(description='Fractal WAV compressor with GPU and convergence decoding')
+    sub = parser.add_subparsers(dest='cmd')
+
+    pc = sub.add_parser('compress')
+    pc.add_argument('input')
+    pc.add_argument('--tile', type=int, default=1024)
+    pc.add_argument('--out', default=None)
+    pc.add_argument('--energy-thresh', type=float, default=1e-4)
+    pc.add_argument('--gpu', action='store_true')
+
+    pd = sub.add_parser('decompress')
+    pd.add_argument('input')
+    pd.add_argument('--out', default=None)
+    pd.add_argument('--iter', type=int, default=8)
+    pd.add_argument('--eps', type=float, default=1e-3)
+    pd.add_argument('--gpu', action='store_true')
+
+    args = parser.parse_args()
+
+    if args.cmd == 'compress':
+        signal, framerate, sampwidth = read_wav_mono(args.input)
+        matches, domains, n_ranges, range_size = compress_audio(signal, framerate, sampwidth, tile_size=args.tile, energy_thresh=args.energy_thresh, use_gpu=args.gpu)
+        outpath = args.out or os.path.splitext(args.input)[0]+'.fwav'
+        save_compressed(outpath, matches, domains, range_size, framerate, sampwidth)
+        print('Compressed file:', outpath)
+
+    elif args.cmd == 'decompress':
+        matches, domains, n_ranges, range_size, framerate, sampwidth = load_compressed(args.input)
+        recon = decompress_audio(matches, domains, n_ranges, range_size, iterations=args.iter, convergence_eps=args.eps, use_gpu=args.gpu)
+        outpath = args.out or os.path.splitext(args.input)[0]+'_recon.wav'
+        write_wav(outpath, recon, framerate, sampwidth)
+        print('Reconstructed WAV:', outpath)
+
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()
