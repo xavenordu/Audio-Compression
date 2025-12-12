@@ -172,20 +172,6 @@ def build_domains_memmap(signal, tile_size, range_size, domain_step=1, block_siz
     return tmp_path, n_domains
 
 
-# ----------------------- Voiced detection -----------------------
-
-def voiced_detection(signal, frame_size=1024, energy_threshold=1e-3):
-    n = len(signal)
-    n_frames = (n + frame_size - 1) // frame_size
-    # pad signal to fit full frames
-    pad_len = n_frames * frame_size - n
-    padded = np.pad(signal, (0, pad_len), mode='constant')
-    frames = padded.reshape(n_frames, frame_size)
-    energies = np.mean(frames**2, axis=1)
-    mask = (energies > energy_threshold).astype(np.uint8)
-    voiced = np.repeat(mask, frame_size)[:n]
-    return voiced
-
 
 # ----------------------- Matching helpers (block-wise) -----------------------
 
@@ -280,6 +266,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
     """
     Compress audio using fractal domain matching.
     Fully GPU/CPU vectorized; no repeated CuPy → NumPy transfers.
+    Uses improved voiced detection with smoothing & hysteresis.
     Returns:
         matches, domains_array, n_ranges, range_size, tile_size, domain_step, energy_threshold
     """
@@ -289,21 +276,49 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
     range_size = max(4, tile_size // 16)
     domain_step = max(1, range_size // 2)
 
-    # voiced detection & masking
-    voiced_mask = voiced_detection(signal, frame_size=range_size*2, energy_threshold=energy_thresh)
+    # ---------------- Improved voiced detection ----------------
+    def voiced_detection(signal, frame_size=range_size*2, energy_threshold=energy_thresh, smooth_window=5, low_threshold=None):
+        signal = np.asarray(signal, dtype=np.float32)
+        n = len(signal)
+        n_frames = (n + frame_size - 1) // frame_size
+        pad_len = n_frames * frame_size - n
+        padded = np.pad(signal, (0, pad_len), mode='reflect')
+
+        frames = padded[:n_frames*frame_size].reshape(n_frames, frame_size)
+        energies = np.mean(frames**2, axis=1)
+
+        if smooth_window > 1:
+            kernel = np.ones(smooth_window) / smooth_window
+            energies = np.convolve(energies, kernel, mode='same')
+
+        if low_threshold is None:
+            low_threshold = energy_threshold * 0.5
+
+        voiced_mask = np.zeros_like(energies, dtype=np.uint8)
+        voiced = False
+        for i in range(len(energies)):
+            if energies[i] > energy_threshold:
+                voiced = True
+            elif energies[i] < low_threshold:
+                voiced = False
+            voiced_mask[i] = int(voiced)
+
+        return np.repeat(voiced_mask, frame_size)[:n]
+
+    # apply voiced detection
+    voiced_mask = voiced_detection(signal)
     weighted_signal = signal * voiced_mask
 
-    # frame ranges
+    # ---------------- frame ranges ----------------
     n_ranges = (len(weighted_signal) - range_size) // range_size + 1
     ranges = weighted_signal[:n_ranges*range_size].reshape(n_ranges, range_size)
 
-    # build domains memmap
+    # ---------------- build domains memmap ----------------
     domains_path, n_domains = build_domains_memmap(signal, tile_size, range_size, domain_step,
                                                    block_size=500, tmpdir=domains_tmpdir, use_gpu=use_gpu)
     if n_domains == 0:
         return [], np.empty((0, range_size), dtype=np.float32), 0, range_size, tile_size, domain_step, energy_thresh
 
-    # compute domain statistics
     d_means, d_vars = compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024)
 
     # load domains once
@@ -312,7 +327,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
 
     matches = []
 
-    # process ranges in blocks
+    # ---------------- process ranges in blocks ----------------
     for start_idx in range(0, n_ranges, batch_size):
         end_idx = min(start_idx + batch_size, n_ranges)
         ranges_block = ranges[start_idx:end_idx]
@@ -322,7 +337,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
         best_scales = xp.empty(end_idx - start_idx, dtype=xp.float32)
         best_errs = xp.empty(end_idx - start_idx, dtype=xp.float32)
 
-        # find best domain for each range in block (GPU-aware)
+        # GPU-aware domain matching
         for i, r in enumerate(ranges_xp):
             idx, s, err = find_best_domain_for_range_blockwise(r, domains_path, n_domains, range_size,
                                                                d_means, d_vars, batch_size=1024, use_gpu=use_gpu)
@@ -330,7 +345,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
             best_scales[i] = s
             best_errs[i] = err
 
-        # symmetry check (fully on GPU/CPU)
+        # symmetry check
         selected_tiles = domains_xp[best_idxs]
         mirrored_tiles = selected_tiles[:, ::-1]
 
@@ -358,26 +373,17 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
 
 def save_compressed(filepath, matches, domains_array, range_size, framerate, sampwidth,
                     tile_size, domain_step, energy_threshold):
+    """
+    Save .fwav with SHA-256 checksum in a memory-efficient single pass.
+    """
     n_ranges = len(matches)
     n_domains = len(domains_array)
 
-    # Build the raw bytes to checksum
-    data_bytes = bytearray()
+    # Initialize SHA-256
+    sha = hashlib.sha256()
 
-    # Domains
-    for d in domains_array:
-        data_bytes.extend(d.astype(np.float32).tobytes())
-
-    # Matches
-    for m in matches:
-        data_bytes.extend(struct.pack('<IffBf', int(m[0]), float(m[1]), float(m[2]),
-                                      int(m[3]), float(m[4])))
-
-    # Compute checksum
-    checksum = hashlib.sha256(data_bytes).digest()
-
-    # Write file
     with open(filepath, 'wb') as f:
+        # Header
         f.write(b'FWAV')
         f.write(struct.pack('<B', FWAV_VERSION))
         f.write(struct.pack('<I', range_size))
@@ -388,20 +394,35 @@ def save_compressed(filepath, matches, domains_array, range_size, framerate, sam
         f.write(struct.pack('<f', energy_threshold))
         f.write(struct.pack('<I', n_ranges))
         f.write(struct.pack('<I', n_domains))
-        
-        # Write checksum (32 bytes)
+
+        # Placeholder for checksum (32 bytes)
+        checksum_pos = f.tell()
+        f.write(b'\0' * 32)
+
+        # Write domains and update hash
+        for d in domains_array:
+            b = d.astype(np.float32).tobytes()
+            f.write(b)
+            sha.update(b)
+
+        # Write matches and update hash
+        for m in matches:
+            b = struct.pack('<IffBf', int(m[0]), float(m[1]), float(m[2]), int(m[3]), float(m[4]))
+            f.write(b)
+            sha.update(b)
+
+        # Finalize checksum
+        checksum = sha.digest()
+
+        # Go back and write checksum
+        f.seek(checksum_pos)
         f.write(checksum)
 
-        # Write domains
-        for d in domains_array:
-            f.write(d.astype(np.float32).tobytes())
-
-        # Write matches
-        for m in matches:
-            f.write(struct.pack('<IffBf', int(m[0]), float(m[1]), float(m[2]),
-                                int(m[3]), float(m[4])))
-            
 def load_compressed(filepath, verify_checksum=True):
+    """
+    Load a FWAV compressed file with optional SHA-256 verification.
+    Memory-efficient: streams domains and matches for checksum calculation.
+    """
     with open(filepath, 'rb') as f:
         if f.read(4) != b'FWAV':
             raise ValueError('Not a FWAV file')
@@ -409,7 +430,7 @@ def load_compressed(filepath, verify_checksum=True):
         version = struct.unpack('<B', f.read(1))[0]
         if version != FWAV_VERSION:
             raise ValueError(f'Unsupported FWAV version: {version}')
-        
+
         # Read metadata
         range_size = struct.unpack('<I', f.read(4))[0]
         framerate = struct.unpack('<I', f.read(4))[0]
@@ -420,23 +441,33 @@ def load_compressed(filepath, verify_checksum=True):
         n_ranges = struct.unpack('<I', f.read(4))[0]
         n_domains = struct.unpack('<I', f.read(4))[0]
 
-        # Read checksum
+        # Read stored checksum
         stored_checksum = f.read(32)
 
-        # Read domains
-        domains = [np.frombuffer(f.read(4*range_size), dtype=np.float32) for _ in range(n_domains)]
-        # Read matches
-        matches = [struct.unpack('<IffBf', f.read(17)) for _ in range(n_ranges)]
+        # Prepare SHA-256 for streaming verification
+        sha = hashlib.sha256() if verify_checksum else None
 
-        # Verify checksum
+        # Read domains
+        domains = []
+        for _ in range(n_domains):
+            b = f.read(4 * range_size)
+            arr = np.frombuffer(b, dtype=np.float32)
+            domains.append(arr)
+            if verify_checksum:
+                sha.update(b)
+
+        # Read matches
+        matches = []
+        for _ in range(n_ranges):
+            b = f.read(17)
+            m = struct.unpack('<IffBf', b)
+            matches.append(m)
+            if verify_checksum:
+                sha.update(b)
+
+        # Verify checksum if requested
         if verify_checksum:
-            data_bytes = bytearray()
-            for d in domains:
-                data_bytes.extend(d.tobytes())
-            for m in matches:
-                data_bytes.extend(struct.pack('<IffBf', int(m[0]), float(m[1]), float(m[2]),
-                                              int(m[3]), float(m[4])))
-            calc_checksum = hashlib.sha256(data_bytes).digest()
+            calc_checksum = sha.digest()
             if calc_checksum != stored_checksum:
                 raise ValueError('Checksum mismatch — file may be corrupted')
 
@@ -488,8 +519,10 @@ def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8,
         out = xp.bincount(scatter_idx, weights=transformed_flat, minlength=recon_len)
         counts = xp.bincount(scatter_idx, weights=counts_flat, minlength=recon_len)
 
-        # Normalize to handle overlaps and silence
-        recon_next = out / xp.maximum(counts, 1.0)
+        # Correct normalization: only divide where counts > 0
+        recon_next = xp.zeros_like(out, dtype=xp.float32)
+        mask_nonzero = counts > 0
+        recon_next[mask_nonzero] = out[mask_nonzero] / counts[mask_nonzero]
 
         # Convergence check
         denom = xp.linalg.norm(recon) if xp.linalg.norm(recon) > 0 else 1.0
@@ -501,7 +534,6 @@ def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8,
             logger.info(f'Converged after {it+1} iterations (delta={delta:.3e})')
             break
 
-    # Return reconstructed signal (still on GPU if use_gpu)
     return recon
 
 
