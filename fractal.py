@@ -26,7 +26,7 @@ from multiprocessing import Pool, cpu_count
 
 # GPU setup
 try:
-    import cupy as cp
+    import cupy as cp # type: ignore
     GPU_AVAILABLE = True
 except Exception:
     cp = np
@@ -192,6 +192,41 @@ def compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024):
         idx += len(means)
     return d_means, d_vars
 
+def build_domain_clusters(d_means, d_vars, n_clusters=32, max_iter=25):
+    """
+    K-means clustering over (mean, variance) space.
+    Returns:
+        cluster_ids: (n_domains,)
+        cluster_centers: (n_clusters, 2)
+    """
+    feats = np.stack([d_means, d_vars], axis=1).astype(np.float32)
+    n_domains = feats.shape[0]
+
+    # Init centers by sampling
+    rng = np.random.default_rng(0)
+    centers = feats[rng.choice(n_domains, size=n_clusters, replace=False)]
+
+    for _ in range(max_iter):
+        # assign
+        dists = ((feats[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        labels = np.argmin(dists, axis=1)
+
+        # update
+        new_centers = np.zeros_like(centers)
+        for k in range(n_clusters):
+            members = feats[labels == k]
+            if len(members):
+                new_centers[k] = members.mean(axis=0)
+            else:
+                new_centers[k] = centers[k]
+
+        if np.allclose(centers, new_centers, atol=1e-6):
+            break
+        centers = new_centers
+
+    return labels.astype(np.int32), centers
+
+
 
 def find_best_domain_for_range_blockwise(range_block, domains_path, n_domains, range_size, d_means, d_vars, batch_size=1024, use_gpu=False):
     """
@@ -252,7 +287,74 @@ def find_best_domain_for_range_blockwise(range_block, domains_path, n_domains, r
 
     return best_idx, best_s, best_err
 
+def find_best_domain_pruned(range_block,
+                            domains_path,
+                            n_domains,
+                            range_size,
+                            d_means,
+                            d_vars,
+                            cluster_ids,
+                            cluster_centers,
+                            top_k_clusters=3,
+                            batch_size=1024,
+                            use_gpu=False):
+    """
+    Pruned domain search using cluster preselection.
+    Returns: idx, s, o, err
+    """
 
+    xp = cp if (use_gpu and GPU_WORKING) else np
+
+    r = range_block
+    r_mean = xp.mean(r)
+    r_var = xp.mean((r - r_mean) ** 2)
+
+    # ---- select closest clusters
+    feat = xp.array([r_mean, r_var], dtype=xp.float32)
+    centers = xp.asarray(cluster_centers)
+
+    dists = xp.sum((centers - feat) ** 2, axis=1)
+    best_clusters = xp.argsort(dists)[:top_k_clusters]
+
+    # collect domain indices
+    best_clusters_np = cp.asnumpy(best_clusters) if (use_gpu and GPU_WORKING) else best_clusters # type: ignore
+    candidate_idxs = np.where(np.isin(cluster_ids, best_clusters_np))[0]
+
+    best_err = xp.inf
+    best_idx = 0
+    best_s = 0.0
+    best_o = 0.0
+    eps = 1e-12
+
+    domains = np.memmap(domains_path, dtype='float32', mode='r',
+                        shape=(n_domains, range_size))
+
+    for start in range(0, len(candidate_idxs), batch_size):
+        batch = candidate_idxs[start:start + batch_size]
+        tiles = xp.asarray(domains[batch]) if (use_gpu and GPU_WORKING) else domains[batch]
+
+        dm = tiles.mean(axis=1)
+        dc = tiles - dm[:, None]
+
+        rc = r - r_mean
+        denom = xp.sum(dc * dc, axis=1)
+        valid = denom > eps
+
+        s = xp.zeros_like(denom)
+        s[valid] = xp.sum(dc[valid] * rc, axis=1) / denom[valid]
+        o = r_mean - s * dm
+
+        recon = s[:, None] * tiles + o[:, None]
+        errs = xp.linalg.norm(recon - r, axis=1)
+
+        i = int(xp.argmin(errs))
+        if errs[i] < best_err:
+            best_err = float(errs[i])
+            best_idx = int(batch[i])
+            best_s = float(s[i])
+            best_o = float(o[i])
+
+    return best_idx, best_s, best_o, best_err
 
 # ----------------------- Symmetry -----------------------
 
@@ -265,30 +367,39 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
                    use_gpu=False, domains_tmpdir=None, batch_size=512):
     """
     Compress audio using fractal domain matching.
-    Fully GPU/CPU vectorized; no repeated CuPy → NumPy transfers.
-    Uses improved voiced detection with smoothing & hysteresis.
     Returns:
-        matches, domains_array, n_ranges, range_size, tile_size, domain_step, energy_threshold
+        matches, domains_array, n_ranges, range_size,
+        tile_size, domain_step, energy_threshold, original_len
     """
+
     xp = cp if (use_gpu and GPU_WORKING) else np
 
-    # range/domain parameters
+    # -------------------------
+    # Parameters
+    # -------------------------
     range_size = max(4, tile_size // 16)
     domain_step = max(1, range_size // 2)
 
-    # ---------------- Improved voiced detection ----------------
-    def voiced_detection(signal, frame_size=range_size*2, energy_threshold=energy_thresh, smooth_window=5, low_threshold=None):
+    # -------------------------
+    # Voiced detection
+    # -------------------------
+    def voiced_detection(signal, frame_size=range_size * 2,
+                         energy_threshold=energy_thresh,
+                         smooth_window=5,
+                         low_threshold=None):
+
         signal = np.asarray(signal, dtype=np.float32)
         n = len(signal)
         n_frames = (n + frame_size - 1) // frame_size
         pad_len = n_frames * frame_size - n
-        padded = np.pad(signal, (0, pad_len), mode='reflect')
 
-        frames = padded[:n_frames*frame_size].reshape(n_frames, frame_size)
-        energies = np.mean(frames**2, axis=1)
+        padded = np.pad(signal, (0, pad_len), mode='reflect')
+        frames = padded.reshape(n_frames, frame_size)
+
+        energies = np.mean(frames * frames, axis=1)
 
         if smooth_window > 1:
-            kernel = np.ones(smooth_window) / smooth_window
+            kernel = np.ones(smooth_window, dtype=np.float32) / smooth_window
             energies = np.convolve(energies, kernel, mode='same')
 
         if low_threshold is None:
@@ -296,90 +407,183 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
 
         voiced_mask = np.zeros_like(energies, dtype=np.uint8)
         voiced = False
-        for i in range(len(energies)):
-            if energies[i] > energy_threshold:
+        for i, e in enumerate(energies):
+            if e > energy_threshold:
                 voiced = True
-            elif energies[i] < low_threshold:
+            elif e < low_threshold:
                 voiced = False
-            voiced_mask[i] = int(voiced)
+            voiced_mask[i] = 1 if voiced else 0
 
         return np.repeat(voiced_mask, frame_size)[:n]
 
-    # apply voiced detection
+    # -------------------------
+    # Apply voiced mask
+    # -------------------------
     voiced_mask = voiced_detection(signal)
     weighted_signal = signal * voiced_mask
 
-    # ---------------- frame ranges ----------------
-    n_ranges = (len(weighted_signal) - range_size) // range_size + 1
-    ranges = weighted_signal[:n_ranges*range_size].reshape(n_ranges, range_size)
+    original_len = len(weighted_signal)
+    pad_len = (range_size - (original_len % range_size)) % range_size
+    if pad_len:
+        weighted_signal = np.pad(weighted_signal, (0, pad_len), mode='reflect')
 
-    # ---------------- build domains memmap ----------------
-    domains_path, n_domains = build_domains_memmap(signal, tile_size, range_size, domain_step,
-                                                   block_size=500, tmpdir=domains_tmpdir, use_gpu=use_gpu)
+    n_ranges = len(weighted_signal) // range_size
+    if n_ranges == 0:
+        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
+               tile_size, domain_step, energy_thresh, original_len
+
+    ranges = weighted_signal.reshape(n_ranges, range_size)
+
+    # -------------------------
+    # Build domains (memmap)
+    # -------------------------
+    domains_path, n_domains = build_domains_memmap(
+        signal, tile_size, range_size, domain_step,
+        block_size=500, tmpdir=domains_tmpdir, use_gpu=use_gpu
+    )
+
     if n_domains == 0:
-        return [], np.empty((0, range_size), dtype=np.float32), 0, range_size, tile_size, domain_step, energy_thresh
+        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
+               tile_size, domain_step, energy_thresh, original_len
 
-    d_means, d_vars = compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024)
+    d_means, d_vars = compute_stats_memmap(
+        domains_path, n_domains, range_size, batch_size=1024
+    )
+    cluster_ids, cluster_centers = build_domain_clusters(
+        d_means, d_vars, n_clusters=32
+    )
 
-    # load domains once
-    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
-    domains_xp = xp.asarray(domains_array, dtype=xp.float32) if use_gpu and GPU_WORKING else domains_array
+    if domains_path is None:
+        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
+               tile_size, domain_step, energy_thresh, original_len
+
+    domains_array = np.memmap(
+        domains_path, dtype='float32', mode='r',
+        shape=(n_domains, range_size)
+    )
+
+    domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
 
     matches = []
+    eps = 1e-12
 
-    # ---------------- process ranges in blocks ----------------
-    for start_idx in range(0, n_ranges, batch_size):
-        end_idx = min(start_idx + batch_size, n_ranges)
-        ranges_block = ranges[start_idx:end_idx]
-        ranges_xp = xp.asarray(ranges_block, dtype=xp.float32) if use_gpu and GPU_WORKING else ranges_block
+    # -------------------------
+    # Process ranges in batches
+    # -------------------------
+    for start in range(0, n_ranges, batch_size):
+        end = min(start + batch_size, n_ranges)
+        ranges_block = ranges[start:end]
+        ranges_xp = xp.asarray(ranges_block) if (use_gpu and GPU_WORKING) else ranges_block
 
-        best_idxs = xp.empty(end_idx - start_idx, dtype=xp.int32)
-        best_scales = xp.empty(end_idx - start_idx, dtype=xp.float32)
-        best_errs = xp.empty(end_idx - start_idx, dtype=xp.float32)
+        block_n = end - start
 
-        # GPU-aware domain matching
+        best_idxs = xp.empty(block_n, dtype=xp.int32)
+        best_scales = xp.empty(block_n, dtype=xp.float32)
+        best_offsets = xp.empty(block_n, dtype=xp.float32)
+        best_errs = xp.empty(block_n, dtype=xp.float32)
+        sym_flags = xp.zeros(block_n, dtype=xp.int8)
+
+        # ---- domain search (pruned)
         for i, r in enumerate(ranges_xp):
-            idx, s, err = find_best_domain_for_range_blockwise(r, domains_path, n_domains, range_size,
-                                                               d_means, d_vars, batch_size=1024, use_gpu=use_gpu)
+            idx, s, o, err = find_best_domain_pruned(
+                r,
+                domains_path,
+                n_domains,
+                range_size,
+                d_means,
+                d_vars,
+                cluster_ids,
+                cluster_centers,
+                batch_size=1024,
+                use_gpu=use_gpu
+            )
+
             best_idxs[i] = idx
             best_scales[i] = s
+            best_offsets[i] = o
             best_errs[i] = err
 
-        # symmetry check
-        selected_tiles = domains_xp[best_idxs]
-        mirrored_tiles = selected_tiles[:, ::-1]
+        # -------------------------
+        # Symmetry-aware affine correction (FIXED)
+        # -------------------------
+        selected = domains_xp[best_idxs]
+        mirrored = selected[:, ::-1]
 
-        errors_orig = xp.linalg.norm(selected_tiles - ranges_xp, axis=1)
-        errors_mirror = xp.linalg.norm(mirrored_tiles - ranges_xp, axis=1)
+        for i in range(block_n):
+            r = ranges_xp[i]
+            r_mean = r.mean()
+            rc = r - r_mean
 
-        sym_flags_block = (errors_mirror < errors_orig).astype(xp.int8)
-        best_errs = xp.where(sym_flags_block, errors_mirror, errors_orig)
+            # original
+            d = selected[i]
+            dm = d.mean()
+            dc = d - dm
+            denom = xp.sum(dc * dc)
+            s0 = xp.sum(rc * dc) / denom if denom > eps else 0.0
+            o0 = r_mean - s0 * dm
+            err0 = xp.linalg.norm(r - (s0 * d + o0))
 
-        # append matches
-        for i in range(end_idx - start_idx):
-            matches.append((int(best_idxs[i]), float(best_scales[i]), float(ranges_block[i].mean()),
-                            int(sym_flags_block[i]), float(best_errs[i])))
+            # mirrored
+            d2 = mirrored[i]
+            dm2 = d2.mean()
+            dc2 = d2 - dm2
+            denom2 = xp.sum(dc2 * dc2)
+            s1 = xp.sum(rc * dc2) / denom2 if denom2 > eps else 0.0
+            o1 = r_mean - s1 * dm2
+            err1 = xp.linalg.norm(r - (s1 * d2 + o1))
 
-    # finalize domains_array as CPU ndarray for .fwav embedding
+            if err1 < err0:
+                sym_flags[i] = 1
+                best_scales[i] = s1
+                best_offsets[i] = o1
+                best_errs[i] = err1
+            else:
+                best_scales[i] = s0
+                best_offsets[i] = o0
+                best_errs[i] = err0
+
+        # -------------------------
+        # Store matches
+        # -------------------------
+        for i in range(block_n):
+            matches.append((
+                int(best_idxs[i]),
+                float(best_scales[i]),
+                float(best_offsets[i]),
+                int(sym_flags[i]),
+                float(best_errs[i])
+            ))
+
+    # -------------------------
+    # Finalize domains & cleanup
+    # -------------------------
     domains_array = np.asarray(domains_array)
     try:
-        os.remove(domains_path)
+        os.remove(domains_path) # type: ignore
     except Exception:
         pass
 
-    return matches, domains_array, n_ranges, range_size, tile_size, domain_step, energy_thresh
-
+    return (
+        matches,
+        domains_array,
+        n_ranges,
+        range_size,
+        tile_size,
+        domain_step,
+        energy_thresh,
+        original_len
+    )
 
 
 def save_compressed(filepath, matches, domains_array, range_size, framerate, sampwidth,
-                    tile_size, domain_step, energy_threshold):
+                    tile_size, domain_step, energy_threshold, original_len):
     """
     Save .fwav with SHA-256 checksum in a memory-efficient single pass.
+    Includes original_len in header to allow exact reconstruction.
     """
     n_ranges = len(matches)
     n_domains = len(domains_array)
 
-    # Initialize SHA-256
     sha = hashlib.sha256()
 
     with open(filepath, 'wb') as f:
@@ -394,18 +598,19 @@ def save_compressed(filepath, matches, domains_array, range_size, framerate, sam
         f.write(struct.pack('<f', energy_threshold))
         f.write(struct.pack('<I', n_ranges))
         f.write(struct.pack('<I', n_domains))
+        f.write(struct.pack('<I', original_len))  # NEW
 
-        # Placeholder for checksum (32 bytes)
+        # Placeholder for checksum
         checksum_pos = f.tell()
         f.write(b'\0' * 32)
 
-        # Write domains and update hash
+        # Write domains
         for d in domains_array:
             b = d.astype(np.float32).tobytes()
             f.write(b)
             sha.update(b)
 
-        # Write matches and update hash
+        # Write matches
         for m in matches:
             b = struct.pack('<IffBf', int(m[0]), float(m[1]), float(m[2]), int(m[3]), float(m[4]))
             f.write(b)
@@ -413,25 +618,23 @@ def save_compressed(filepath, matches, domains_array, range_size, framerate, sam
 
         # Finalize checksum
         checksum = sha.digest()
-
-        # Go back and write checksum
         f.seek(checksum_pos)
         f.write(checksum)
+
 
 def load_compressed(filepath, verify_checksum=True):
     """
     Load a FWAV compressed file with optional SHA-256 verification.
-    Memory-efficient: streams domains and matches for checksum calculation.
+    Returns original_len as well.
     """
     with open(filepath, 'rb') as f:
         if f.read(4) != b'FWAV':
             raise ValueError('Not a FWAV file')
-        
+
         version = struct.unpack('<B', f.read(1))[0]
         if version != FWAV_VERSION:
             raise ValueError(f'Unsupported FWAV version: {version}')
 
-        # Read metadata
         range_size = struct.unpack('<I', f.read(4))[0]
         framerate = struct.unpack('<I', f.read(4))[0]
         sampwidth = struct.unpack('<B', f.read(1))[0]
@@ -440,99 +643,111 @@ def load_compressed(filepath, verify_checksum=True):
         energy_threshold = struct.unpack('<f', f.read(4))[0]
         n_ranges = struct.unpack('<I', f.read(4))[0]
         n_domains = struct.unpack('<I', f.read(4))[0]
+        original_len = struct.unpack('<I', f.read(4))[0]  # NEW
 
-        # Read stored checksum
         stored_checksum = f.read(32)
-
-        # Prepare SHA-256 for streaming verification
         sha = hashlib.sha256() if verify_checksum else None
 
-        # Read domains
         domains = []
         for _ in range(n_domains):
             b = f.read(4 * range_size)
             arr = np.frombuffer(b, dtype=np.float32)
             domains.append(arr)
             if verify_checksum:
-                sha.update(b)
+                sha.update(b) # type: ignore
 
-        # Read matches
         matches = []
         for _ in range(n_ranges):
             b = f.read(17)
             m = struct.unpack('<IffBf', b)
             matches.append(m)
             if verify_checksum:
-                sha.update(b)
+                sha.update(b) # type: ignore
 
-        # Verify checksum if requested
         if verify_checksum:
-            calc_checksum = sha.digest()
+            calc_checksum = sha.digest() # type: ignore
             if calc_checksum != stored_checksum:
                 raise ValueError('Checksum mismatch — file may be corrupted')
 
     domains_array = np.vstack(domains)
     matches_list = [(int(m[0]), float(m[1]), float(m[2]), int(m[3]), float(m[4])) for m in matches]
 
-    return matches_list, domains_array, n_ranges, range_size, framerate, sampwidth, tile_size, domain_step, energy_threshold
+    return matches_list, domains_array, n_ranges, range_size, framerate, sampwidth, tile_size, domain_step, energy_threshold, original_len
 
 
-def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8, convergence_eps=1e-3, use_gpu=False):
+def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8,
+                     convergence_eps=1e-3, use_gpu=False, original_len=None,
+                     s_clip=16.0, s_damping=0.0):
     """
-    Fully vectorized fractal audio reconstruction using domain matches.
-    Overlapping tiles are correctly averaged; supports CPU (NumPy) or GPU (CuPy).
-    Fully GPU/CPU vectorized without repeated transfers.
+    Vectorized fractal audio reconstruction with optional iterative per-iteration
+    refinement of the scale. Returns reconstructed 1-D array (NumPy or CuPy array)
+    Output trimmed to original_len if provided.
     """
     xp = cp if (use_gpu and GPU_WORKING) else np
 
     recon_len = n_ranges * range_size
     recon = xp.zeros(recon_len, dtype=xp.float32)
 
-    # Precompute indices and parameters
     domain_indices = xp.array([m[0] for m in matches], dtype=xp.int32)
-    scales = xp.array([m[1] for m in matches], dtype=xp.float32)
-    means_r = xp.array([m[2] for m in matches], dtype=xp.float32)
+    s_stored = xp.array([m[1] for m in matches], dtype=xp.float32)
+    o_stored = xp.array([m[2] for m in matches], dtype=xp.float32)
     sym_flags = xp.array([m[3] for m in matches], dtype=xp.bool_)
 
-    # Move domains once to GPU/CPU array
-    domains_xp = xp.asarray(domains_array, dtype=xp.float32) if use_gpu and GPU_WORKING else domains_array
+    domains_xp = xp.asarray(domains_array, dtype=xp.float32) if (use_gpu and GPU_WORKING) else domains_array
 
-    # Precompute scatter indices for overlapping tiles
-    starts = xp.arange(n_ranges) * range_size
-    scatter_idx = xp.repeat(starts, range_size) + xp.tile(xp.arange(range_size), n_ranges)
+    starts = xp.arange(n_ranges, dtype=xp.int32) * range_size
+    scatter_idx = xp.repeat(starts, range_size) + xp.tile(xp.arange(range_size, dtype=xp.int32), n_ranges)
     counts_flat = xp.ones(n_ranges * range_size, dtype=xp.float32)
+    eps = 1e-12
 
     for it in range(iterations):
-        # Extract tiles and apply symmetry
+        recon_ranges = recon.reshape(n_ranges, range_size)
+
         tiles = domains_xp[domain_indices]
         if sym_flags.any():
             tiles = xp.where(sym_flags[:, None], tiles[:, ::-1], tiles)
 
-        # Affine transformation
-        mean_d = tiles.mean(axis=1, keepdims=True)
-        transformed = scales[:, None] * (tiles - mean_d) + means_r[:, None]
+        mean_d = tiles.mean(axis=1)
+        tiles_centered = tiles - mean_d[:, None]
 
-        # Flatten for scatter
+        mean_r_cur = recon_ranges.mean(axis=1)
+        ranges_centered = recon_ranges - mean_r_cur[:, None]
+
+        numerator = xp.sum(ranges_centered * tiles_centered, axis=1)
+        denom = xp.sum(tiles_centered * tiles_centered, axis=1)
+
+        valid = denom > eps
+        s_opt = xp.zeros_like(denom)
+        if xp.any(valid):
+            s_opt[valid] = numerator[valid] / denom[valid]
+
+        s_used = ((1.0 - s_damping) * s_stored + s_damping * s_opt) if s_damping > 0 else xp.where(valid, s_opt, s_stored)
+        s_used = xp.clip(s_used, -abs(s_clip), abs(s_clip))
+
+        o = o_stored
+        transformed = s_used[:, None] * tiles + o[:, None]
+
         transformed_flat = transformed.ravel()
-
-        # Accumulate values and counts using bincount
         out = xp.bincount(scatter_idx, weights=transformed_flat, minlength=recon_len)
         counts = xp.bincount(scatter_idx, weights=counts_flat, minlength=recon_len)
 
-        # Correct normalization: only divide where counts > 0
         recon_next = xp.zeros_like(out, dtype=xp.float32)
-        mask_nonzero = counts > 0
-        recon_next[mask_nonzero] = out[mask_nonzero] / counts[mask_nonzero]
+        nz = counts > 0
+        if nz.any():
+            recon_next[nz] = out[nz] / counts[nz]
 
-        # Convergence check
-        denom = xp.linalg.norm(recon) if xp.linalg.norm(recon) > 0 else 1.0
-        delta = float(xp.linalg.norm(recon_next - recon) / denom)
+        denom_norm = xp.linalg.norm(recon) if xp.linalg.norm(recon) > 0 else 1.0
+        delta = float(xp.linalg.norm(recon_next - recon) / denom_norm)
         recon = recon_next
 
         logger.debug(f'Iteration {it+1}: delta={delta:.6e}')
         if delta < convergence_eps:
             logger.info(f'Converged after {it+1} iterations (delta={delta:.3e})')
             break
+
+    # Trim to original_len if provided
+    if original_len is not None:
+        recon = recon[:original_len]
 
     return recon
 
@@ -557,16 +772,21 @@ def process_file_compress(path, outdir=None, tile=1024, energy_thresh=1e-4, use_
         start = time.time()
         signal, framerate, sampwidth = read_wav_mono(path)
 
-
         if sampwidth == 4: 
             signal = signal.astype(np.float32)
             signal = np.clip(signal, -1.0, 1.0)  # optional safety clipping
 
-        matches, domains, n_ranges, range_size, tile_size, domain_step, energy_threshold = \
+        matches, domains, n_ranges, range_size, tile_size, domain_step, energy_threshold, original_len = \
             compress_audio(signal, framerate, sampwidth, tile_size=tile, energy_thresh=energy_thresh, use_gpu=use_gpu)
 
+        # Ensure output directory exists
+        if outdir and not os.path.exists(outdir):
+            os.makedirs(outdir)
+
         outpath = (os.path.splitext(path)[0] + '.fwav') if outdir is None else os.path.join(outdir, os.path.basename(path) + '.fwav')
-        save_compressed(outpath, matches, domains, range_size, framerate, sampwidth, tile_size, domain_step, energy_threshold)
+        save_compressed(outpath, matches, domains, range_size, framerate, sampwidth,
+                        tile_size, domain_step, energy_threshold, original_len)
+
         elapsed = time.time() - start
         in_size = os.path.getsize(path)
         out_size = os.path.getsize(outpath)
@@ -578,19 +798,23 @@ def process_file_compress(path, outdir=None, tile=1024, energy_thresh=1e-4, use_
         return {'input': path, 'error': str(e)}
 
 
-
 def process_file_decompress(path, outdir=None, iterations=8, eps=1e-3, use_gpu=False):
     try:
         start = time.time()
-        matches, domains, n_ranges, range_size, framerate, sampwidth, _, _, _ = load_compressed(path)
-        recon = decompress_audio(matches, domains, n_ranges, range_size, iterations=iterations, convergence_eps=eps, use_gpu=use_gpu)
+        matches, domains, n_ranges, range_size, framerate, sampwidth, tile_size, domain_step, energy_threshold, original_len = load_compressed(path)
+        recon = decompress_audio(matches, domains, n_ranges, range_size,
+                                 iterations=iterations, convergence_eps=eps,
+                                 use_gpu=use_gpu, original_len=original_len)
 
-  
+        if outdir and not os.path.exists(outdir):
+            os.makedirs(outdir)
+
         if sampwidth == 4:  # float WAV
             recon = np.clip(recon, -1.0, 1.0)
 
         outpath = (os.path.splitext(path)[0] + '_recon.wav') if outdir is None else os.path.join(outdir, os.path.basename(path) + '_recon.wav')
         write_wav(outpath, np.asarray(recon), framerate, sampwidth)
+
         elapsed = time.time() - start
         logger.info(f'Decompressed {path} -> {outpath}  time={elapsed:.2f}s')
         return {'input': path, 'output': outpath, 'time_s': elapsed}
@@ -598,13 +822,13 @@ def process_file_decompress(path, outdir=None, iterations=8, eps=1e-3, use_gpu=F
         logger.exception('Decompression failed for %s', path)
         return {'input': path, 'error': str(e)}
 
-
 # ----------------------- CLI -----------------------
 
 def main():
     parser = argparse.ArgumentParser(description='Fractal WAV compressor with GPU, batch processing, and metrics')
     sub = parser.add_subparsers(dest='cmd')
 
+    # ---------------- Compress ----------------
     pc = sub.add_parser('compress')
     pc.add_argument('input', help='input file or directory')
     pc.add_argument('--tile', type=int, default=1024)
@@ -614,6 +838,7 @@ def main():
     pc.add_argument('--batch', action='store_true', help='treat input as directory and compress all WAV inside')
     pc.add_argument('--workers', type=int, default=4, help='parallel file-level workers for batch')
 
+    # ---------------- Decompress ----------------
     pd = sub.add_parser('decompress')
     pd.add_argument('input', help='input file or directory')
     pd.add_argument('--out', default=None, help='output file or directory')
@@ -628,42 +853,66 @@ def main():
     if args.cmd == 'compress':
         if args.batch and os.path.isdir(args.input):
             files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.lower().endswith('.wav')]
-            logger.info(f'Batch compressing {len(files)} files using {args.workers} workers')
-            pool = Pool(processes=min(args.workers, len(files)))
-            try:
-                jobs = [pool.apply_async(process_file_compress, (f, args.out, args.tile, args.energy_thresh, args.gpu)) for f in files]
-                results = [j.get() for j in jobs]
-            finally:
-                pool.close()
-                pool.join()
-            metrics_file = os.path.join(args.out or args.input, 'compression_metrics.json')
-            with open(metrics_file, 'w') as mf:
-                json.dump(results, mf, indent=2)
-            logger.info(f'Wrote metrics to {metrics_file}')
+            # Skip files that already have .fwav output
+            files_to_process = []
+            for f in files:
+                outpath = (os.path.splitext(f)[0] + '.fwav') if args.out is None else os.path.join(args.out, os.path.basename(f) + '.fwav')
+                if not os.path.exists(outpath):
+                    files_to_process.append(f)
+            logger.info(f'Batch compressing {len(files_to_process)}/{len(files)} files using {args.workers} workers')
+
+            if files_to_process:
+                pool = Pool(processes=min(args.workers, len(files_to_process)))
+                try:
+                    jobs = [pool.apply_async(process_file_compress, (f, args.out, args.tile, args.energy_thresh, args.gpu)) for f in files_to_process]
+                    results = [j.get() for j in jobs]
+                finally:
+                    pool.close()
+                    pool.join()
+
+                metrics_file = os.path.join(args.out or args.input, 'compression_metrics.json')
+                os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+                with open(metrics_file, 'w') as mf:
+                    json.dump(results, mf, indent=2)
+                logger.info(f'Wrote metrics to {metrics_file}')
+            else:
+                logger.info('No files to compress — all already exist.')
         else:
-            # single file
-            process_file_compress(args.input,args.out,args.tile,args.energy_thresh,args.gpu)
+            process_file_compress(args.input, args.out, args.tile, args.energy_thresh, args.gpu)
 
     elif args.cmd == 'decompress':
         if args.batch and os.path.isdir(args.input):
             files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.lower().endswith('.fwav')]
-            logger.info(f'Batch decompressing {len(files)} files using {args.workers} workers')
-            pool = Pool(processes=min(args.workers, len(files)))
-            try:
-                jobs = [pool.apply_async(process_file_decompress, (f, args.out, args.iter, args.eps, args.gpu)) for f in files]
-                results = [j.get() for j in jobs]
-            finally:
-                pool.close()
-                pool.join()
-            metrics_file = os.path.join(args.out or args.input, 'decompression_metrics.json')
-            with open(metrics_file, 'w') as mf:
-                json.dump(results, mf, indent=2)
-            logger.info(f'Wrote metrics to {metrics_file}')
+            # Skip files that already have reconstructed output
+            files_to_process = []
+            for f in files:
+                outpath = (os.path.splitext(f)[0] + '_recon.wav') if args.out is None else os.path.join(args.out, os.path.basename(f) + '_recon.wav')
+                if not os.path.exists(outpath):
+                    files_to_process.append(f)
+            logger.info(f'Batch decompressing {len(files_to_process)}/{len(files)} files using {args.workers} workers')
+
+            if files_to_process:
+                pool = Pool(processes=min(args.workers, len(files_to_process)))
+                try:
+                    jobs = [pool.apply_async(process_file_decompress, (f, args.out, args.iter, args.eps, args.gpu)) for f in files_to_process]
+                    results = [j.get() for j in jobs]
+                finally:
+                    pool.close()
+                    pool.join()
+
+                metrics_file = os.path.join(args.out or args.input, 'decompression_metrics.json')
+                os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+                with open(metrics_file, 'w') as mf:
+                    json.dump(results, mf, indent=2)
+                logger.info(f'Wrote metrics to {metrics_file}')
+            else:
+                logger.info('No files to decompress — all already exist.')
         else:
-            process_file_decompress(args.input,args.out,args.iter,args.eps,args.gpu)
-            
+            process_file_decompress(args.input, args.out, args.iter, args.eps, args.gpu)
+
     else:
         parser.print_help()
+
 
 if __name__ == '__main__':
     main()
