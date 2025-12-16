@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 fractal_wav_compressor_gpu_cli.py
 Upgraded fractal compressor/decompressor for WAV files with GPU support, memory mapping, convergence-based iterative decoding,
@@ -411,55 +410,73 @@ def apply_symmetry(tile):
 
 # ----------------------- Compression & Decompression (memmap-enabled) -----------------------
 
+# ---------------- Top-level voiced detection ----------------
+def voiced_detection(signal, frame_size=64, energy_threshold=1e-4, smooth_window=5, low_threshold=None):
+    """
+    Detect voiced regions in a signal.
+    Returns a binary mask (1=voiced, 0=unvoiced) of the same length as signal.
+    """
+    signal = np.asarray(signal, dtype=np.float32)
+    n = len(signal)
+    n_frames = (n + frame_size - 1) // frame_size
+    pad_len = n_frames * frame_size - n
+    padded = np.pad(signal, (0, pad_len), mode='reflect')
+    frames = padded.reshape(n_frames, frame_size)
+    energies = np.mean(frames * frames, axis=1)
+
+    if smooth_window > 1:
+        kernel = np.ones(smooth_window, dtype=np.float32) / smooth_window
+        energies = np.convolve(energies, kernel, mode='same')
+
+    if low_threshold is None:
+        low_threshold = energy_threshold * 0.5
+
+    voiced_mask = np.zeros_like(energies, dtype=np.uint8)
+    voiced = False
+    for i, e in enumerate(energies):
+        if e > energy_threshold:
+            voiced = True
+        elif e < low_threshold:
+            voiced = False
+        voiced_mask[i] = 1 if voiced else 0
+
+    return np.repeat(voiced_mask, frame_size)[:n]
+
+
+# ---------------- Top-level worker for multiprocessing ----------------
+def _process_range(idx, ranges, domains_path, n_domains, range_size,
+                   d_means, d_vars, cluster_ids, cluster_centers, batch_size=1024, use_gpu=False):
+    """
+    Worker function to process a single range for fractal compression.
+    """
+    r = ranges[idx]
+
+    # Pruned hierarchical matcher handles clusters, coarse distance, and exact solve
+    idx_d, s, o, sym_flag, err = find_best_domain_pruned(
+        r, domains_path, n_domains, range_size,
+        d_means, d_vars, cluster_ids, cluster_centers,
+        top_k_clusters=3, batch_size=batch_size, use_gpu=use_gpu
+    )
+
+    return (idx_d, float(s), float(o), int(sym_flag), float(err))
+
+
+# ---------------- compress_audio ----------------
 def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1e-4,
                    use_gpu=False, domains_tmpdir=None, batch_size=512):
     """
-    Compress audio using fractal domain matching with safe multiprocessing and
-    per-range symmetry-aware affine correction integrated into hierarchical pruning.
+    Compress audio using fractal domain matching with safe multiprocessing.
     Returns:
         matches, domains_array, n_ranges, range_size,
         tile_size, domain_step, energy_threshold, original_len
     """
-
     xp = cp if (use_gpu and GPU_WORKING) else np
 
     range_size = max(4, tile_size // 16)
     domain_step = max(1, range_size // 2)
 
-    # -------------------------
-    # Voiced detection
-    # -------------------------
-    def voiced_detection(signal, frame_size=range_size*2,
-                         energy_threshold=energy_thresh,
-                         smooth_window=5,
-                         low_threshold=None):
-
-        signal = np.asarray(signal, dtype=np.float32)
-        n = len(signal)
-        n_frames = (n + frame_size - 1) // frame_size
-        pad_len = n_frames * frame_size - n
-        padded = np.pad(signal, (0, pad_len), mode='reflect')
-        frames = padded.reshape(n_frames, frame_size)
-        energies = np.mean(frames * frames, axis=1)
-        if smooth_window > 1:
-            kernel = np.ones(smooth_window, dtype=np.float32) / smooth_window
-            energies = np.convolve(energies, kernel, mode='same')
-        if low_threshold is None:
-            low_threshold = energy_threshold * 0.5
-        voiced_mask = np.zeros_like(energies, dtype=np.uint8)
-        voiced = False
-        for i, e in enumerate(energies):
-            if e > energy_threshold:
-                voiced = True
-            elif e < low_threshold:
-                voiced = False
-            voiced_mask[i] = 1 if voiced else 0
-        return np.repeat(voiced_mask, frame_size)[:n]
-
-    # -------------------------
-    # Apply voiced mask
-    # -------------------------
-    voiced_mask = voiced_detection(signal)
+    # ---------------- Voiced detection ----------------
+    voiced_mask = voiced_detection(signal, frame_size=range_size*2, energy_threshold=energy_thresh)
     weighted_signal = signal * voiced_mask
 
     original_len = len(weighted_signal)
@@ -474,9 +491,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
 
     ranges = weighted_signal.reshape(n_ranges, range_size)
 
-    # -------------------------
-    # Build domains (memmap)
-    # -------------------------
+    # ---------------- Build domains (memmap) ----------------
     domains_path, n_domains = build_domains_memmap(
         signal, tile_size, range_size, domain_step,
         block_size=500, tmpdir=domains_tmpdir, use_gpu=use_gpu
@@ -485,42 +500,29 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
         return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
                tile_size, domain_step, energy_thresh, original_len
 
-    # Compute domain statistics & clusters
     d_means, d_vars = compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024)
     cluster_ids, cluster_centers = build_domain_clusters(d_means, d_vars, n_clusters=32)
 
-    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size)) # type: ignore
+    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
     domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
 
-    # -------------------------
-    # Worker: per-range hierarchical pruning + symmetry-aware affine
-    # -------------------------
-    def _process_range(idx):
-        r = ranges[idx]
-
-        # Pruned hierarchical matcher handles clusters, coarse distance, and exact solve
-        idx_d, s, o, sym_flag, err = find_best_domain_pruned( # type: ignore
-            r, domains_path, n_domains, range_size,
-            d_means, d_vars, cluster_ids, cluster_centers,
-            top_k_clusters=3, batch_size=1024, use_gpu=use_gpu
-        )
-
-        return (idx_d, float(s), float(o), int(sym_flag), float(err))
-
-    # -------------------------
-    # Parallel processing
-    # -------------------------
+    # ---------------- Parallel processing ----------------
     matches = []
-    with mp.Pool(mp.cpu_count()) as pool:
-        for res in pool.imap(_process_range, range(n_ranges), chunksize=batch_size):
-            matches.append(res)
+    import multiprocessing as mp
+    args_list = [
+        (i, ranges, domains_path, n_domains, range_size,
+         d_means, d_vars, cluster_ids, cluster_centers, batch_size, use_gpu)
+        for i in range(n_ranges)
+    ]
 
-    # -------------------------
-    # Cleanup
-    # -------------------------
+    with mp.Pool(mp.cpu_count()) as pool:
+        results = pool.starmap(_process_range, args_list)
+        matches.extend(results)
+
+    # ---------------- Cleanup ----------------
     domains_array_cpu = np.asarray(domains_array)
     try:
-        os.remove(domains_path) # type: ignore
+        os.remove(domains_path)
     except Exception:
         pass
 
@@ -739,6 +741,8 @@ def process_file_compress(path, outdir=None, tile=1024, energy_thresh=1e-4, use_
 
         matches, domains, n_ranges, range_size, tile_size, domain_step, energy_threshold, original_len = \
             compress_audio(signal, framerate, sampwidth, tile_size=tile, energy_thresh=energy_thresh, use_gpu=use_gpu)
+        
+        logger.info(f'Processed {len(matches)} ranges, domain matrix shape {domains.shape}')
 
         # Ensure output directory exists
         if outdir and not os.path.exists(outdir):
@@ -791,9 +795,15 @@ def main():
 
     # ---------------- Compress ----------------
     pc = sub.add_parser('compress')
-    pc.add_argument('input', help='input file or directory')
+    pc.add_argument('input', help='input WAV file or directory')
+    pc.add_argument(
+        'output',
+        nargs='?',
+        default=None,
+        help='output FWAV file (required unless --batch)'
+    )
     pc.add_argument('--tile', type=int, default=1024)
-    pc.add_argument('--out', default=None, help='output file or directory')
+    pc.add_argument('--out', default=None, help='output directory (batch mode)')
     pc.add_argument('--energy-thresh', type=float, default=1e-4)
     pc.add_argument('--gpu', action='store_true')
     pc.add_argument('--batch', action='store_true', help='treat input as directory and compress all WAV inside')
@@ -812,64 +822,90 @@ def main():
     args = parser.parse_args()
 
     if args.cmd == 'compress':
-        if args.batch and os.path.isdir(args.input):
+        # ---------------- Non-batch ----------------
+        if not args.batch:
+            if args.output is None:
+                parser.error("compress requires OUTPUT unless --batch is used")
+            # args.out is literal file path in non-batch
+            process_file_compress(args.input, args.output, args.tile, args.energy_thresh, args.gpu)
+
+        # ---------------- Batch ----------------
+        else:
+            if args.output is not None:
+                parser.error("Do not provide positional OUTPUT when using --batch; use --out instead")
+            out_dir = args.out or args.input
             files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.lower().endswith('.wav')]
-            # Skip files that already have .fwav output
             files_to_process = []
             for f in files:
-                outpath = (os.path.splitext(f)[0] + '.fwav') if args.out is None else os.path.join(args.out, os.path.basename(f) + '.fwav')
+                outpath = os.path.join(out_dir, os.path.basename(f) + '.fwav')
                 if not os.path.exists(outpath):
                     files_to_process.append(f)
+
             logger.info(f'Batch compressing {len(files_to_process)}/{len(files)} files using {args.workers} workers')
 
             if files_to_process:
                 pool = Pool(processes=min(args.workers, len(files_to_process)))
                 try:
-                    jobs = [pool.apply_async(process_file_compress, (f, args.out, args.tile, args.energy_thresh, args.gpu)) for f in files_to_process]
+                    jobs = [
+                        pool.apply_async(
+                            process_file_compress,
+                            (f, os.path.join(out_dir, os.path.basename(f) + '.fwav'),
+                             args.tile, args.energy_thresh, args.gpu)
+                        ) for f in files_to_process
+                    ]
                     results = [j.get() for j in jobs]
                 finally:
                     pool.close()
                     pool.join()
 
-                metrics_file = os.path.join(args.out or args.input, 'compression_metrics.json')
+                metrics_file = os.path.join(out_dir, 'compression_metrics.json')
                 os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
                 with open(metrics_file, 'w') as mf:
                     json.dump(results, mf, indent=2)
                 logger.info(f'Wrote metrics to {metrics_file}')
             else:
                 logger.info('No files to compress — all already exist.')
-        else:
-            process_file_compress(args.input, args.out, args.tile, args.energy_thresh, args.gpu)
 
     elif args.cmd == 'decompress':
-        if args.batch and os.path.isdir(args.input):
+        # ---------------- Non-batch ----------------
+        if not args.batch:
+            out_file = args.out or (os.path.splitext(args.input)[0] + '_recon.wav')
+            process_file_decompress(args.input, out_file, args.iter, args.eps, args.gpu)
+
+        # ---------------- Batch ----------------
+        else:
+            out_dir = args.out or args.input
             files = [os.path.join(args.input, f) for f in os.listdir(args.input) if f.lower().endswith('.fwav')]
-            # Skip files that already have reconstructed output
             files_to_process = []
             for f in files:
-                outpath = (os.path.splitext(f)[0] + '_recon.wav') if args.out is None else os.path.join(args.out, os.path.basename(f) + '_recon.wav')
+                outpath = os.path.join(out_dir, os.path.basename(f).replace('.fwav', '_recon.wav'))
                 if not os.path.exists(outpath):
                     files_to_process.append(f)
+
             logger.info(f'Batch decompressing {len(files_to_process)}/{len(files)} files using {args.workers} workers')
 
             if files_to_process:
                 pool = Pool(processes=min(args.workers, len(files_to_process)))
                 try:
-                    jobs = [pool.apply_async(process_file_decompress, (f, args.out, args.iter, args.eps, args.gpu)) for f in files_to_process]
+                    jobs = [
+                        pool.apply_async(
+                            process_file_decompress,
+                            (f, os.path.join(out_dir, os.path.basename(f).replace('.fwav', '_recon.wav')),
+                             args.iter, args.eps, args.gpu)
+                        ) for f in files_to_process
+                    ]
                     results = [j.get() for j in jobs]
                 finally:
                     pool.close()
                     pool.join()
 
-                metrics_file = os.path.join(args.out or args.input, 'decompression_metrics.json')
+                metrics_file = os.path.join(out_dir, 'decompression_metrics.json')
                 os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
                 with open(metrics_file, 'w') as mf:
                     json.dump(results, mf, indent=2)
                 logger.info(f'Wrote metrics to {metrics_file}')
             else:
                 logger.info('No files to decompress — all already exist.')
-        else:
-            process_file_decompress(args.input, args.out, args.iter, args.eps, args.gpu)
 
     else:
         parser.print_help()
