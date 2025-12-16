@@ -24,6 +24,10 @@ import logging
 import tempfile
 from multiprocessing import Pool, cpu_count
 
+import multiprocessing as mp
+from functools import partial
+
+
 # GPU setup
 try:
     import cupy as cp # type: ignore
@@ -296,65 +300,109 @@ def find_best_domain_pruned(range_block,
                             cluster_ids,
                             cluster_centers,
                             top_k_clusters=3,
+                            coarse_downsample=4,
+                            top_k_domains=16,
                             batch_size=1024,
                             use_gpu=False):
     """
-    Pruned domain search using cluster preselection.
-    Returns: idx, s, o, err
+    Pruned hierarchical domain search using clusters with symmetry-aware affine correction.
+
+    Stages:
+      A) Cluster preselection (cheap: O(num_clusters))
+      B) Coarse distance (downsampled: O(K*range_size/coarse_downsample))
+      C) Exact affine solve with mirror check (O(K))
+
+    Returns:
+        best_idx, best_s, best_o, sym_flag, best_err
     """
 
     xp = cp if (use_gpu and GPU_WORKING) else np
-
-    r = range_block
-    r_mean = xp.mean(r)
-    r_var = xp.mean((r - r_mean) ** 2)
-
-    # ---- select closest clusters
-    feat = xp.array([r_mean, r_var], dtype=xp.float32)
-    centers = xp.asarray(cluster_centers)
-
-    dists = xp.sum((centers - feat) ** 2, axis=1)
-    best_clusters = xp.argsort(dists)[:top_k_clusters]
-
-    # collect domain indices
-    best_clusters_np = cp.asnumpy(best_clusters) if (use_gpu and GPU_WORKING) else best_clusters # type: ignore
-    candidate_idxs = np.where(np.isin(cluster_ids, best_clusters_np))[0]
-
-    best_err = xp.inf
-    best_idx = 0
-    best_s = 0.0
-    best_o = 0.0
+    r = xp.asarray(range_block, dtype=xp.float32)
+    r_mean = float(r.mean())
+    r_var = float(xp.var(r))
+    m = range_size
     eps = 1e-12
 
-    domains = np.memmap(domains_path, dtype='float32', mode='r',
-                        shape=(n_domains, range_size))
+    # -------------------------
+    # Stage A: Cluster preselection
+    # -------------------------
+    feat = xp.array([r_mean, r_var], dtype=xp.float32)
+    centers = xp.asarray(cluster_centers, dtype=xp.float32)
+    dists = xp.sum((centers - feat)**2, axis=1)
+    best_clusters = xp.argsort(dists)[:top_k_clusters]
 
-    for start in range(0, len(candidate_idxs), batch_size):
-        batch = candidate_idxs[start:start + batch_size]
-        tiles = xp.asarray(domains[batch]) if (use_gpu and GPU_WORKING) else domains[batch]
+    best_clusters_np = cp.asnumpy(best_clusters) if (use_gpu and GPU_WORKING) else best_clusters # type: ignore
+    candidate_idxs = np.where(np.isin(cluster_ids, best_clusters_np))[0]
+    if len(candidate_idxs) == 0:
+        return -1, 0.0, 0.0, 0, float('inf')
 
-        dm = tiles.mean(axis=1)
-        dc = tiles - dm[:, None]
+    # -------------------------
+    # Stage B: Coarse downsampled distance
+    # -------------------------
+    ds = max(1, m // coarse_downsample)
+    r_ds = r[::ds]
 
-        rc = r - r_mean
-        denom = xp.sum(dc * dc, axis=1)
-        valid = denom > eps
+    domains_mm = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
+    coarse_errs = []
+    for idx in candidate_idxs:
+        d = domains_mm[int(idx)][::ds]
+        coarse_errs.append(xp.linalg.norm(r_ds - xp.asarray(d)))
+    coarse_errs = xp.asarray(coarse_errs)
+    k = min(top_k_domains, len(coarse_errs))
+    shortlist = candidate_idxs[xp.argsort(coarse_errs)[:k]]
 
-        s = xp.zeros_like(denom)
-        s[valid] = xp.sum(dc[valid] * rc, axis=1) / denom[valid]
-        o = r_mean - s * dm
+    # -------------------------
+    # Stage C: Exact affine solve + mirrored
+    # -------------------------
+    best_err = float('inf')
+    best_idx = -1
+    best_s = 0.0
+    best_o = 0.0
+    sym_flag = 0
 
-        recon = s[:, None] * tiles + o[:, None]
-        errs = xp.linalg.norm(recon - r, axis=1)
+    for idx in shortlist:
+        tile = xp.asarray(domains_mm[int(idx)], dtype=xp.float32)
+        tile_mean = float(tile.mean())
+        tile_c = tile - tile_mean
+        r_c = r - r_mean
+        denom = float(xp.sum(tile_c * tile_c))
+        if denom < eps:
+            continue
+        # Original
+        s0 = float(xp.sum(r_c * tile_c) / denom)
+        o0 = r_mean - s0 * tile_mean
+        err0 = float(xp.linalg.norm(r - (s0*tile + o0)))
 
-        i = int(xp.argmin(errs))
-        if errs[i] < best_err:
-            best_err = float(errs[i])
-            best_idx = int(batch[i])
-            best_s = float(s[i])
-            best_o = float(o[i])
+        # Mirrored
+        tile_m = tile[::-1]
+        tile_m_mean = float(tile_m.mean())
+        tile_m_c = tile_m - tile_m_mean
+        denom_m = float(xp.sum(tile_m_c * tile_m_c))
+        if denom_m < eps:
+            continue
+        s1 = float(xp.sum(r_c * tile_m_c) / denom_m)
+        o1 = r_mean - s1 * tile_m_mean
+        err1 = float(xp.linalg.norm(r - (s1*tile_m + o1)))
 
-    return best_idx, best_s, best_o, best_err
+        if err1 < err0:
+            err = err1
+            s = s1
+            o = o1
+            sym = 1
+        else:
+            err = err0
+            s = s0
+            o = o0
+            sym = 0
+
+        if err < best_err:
+            best_err = err
+            best_idx = int(idx)
+            best_s = s
+            best_o = o
+            sym_flag = sym
+
+    return best_idx, best_s, best_o, sym_flag, best_err
 
 # ----------------------- Symmetry -----------------------
 
@@ -366,7 +414,8 @@ def apply_symmetry(tile):
 def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1e-4,
                    use_gpu=False, domains_tmpdir=None, batch_size=512):
     """
-    Compress audio using fractal domain matching.
+    Compress audio using fractal domain matching with safe multiprocessing and
+    per-range symmetry-aware affine correction integrated into hierarchical pruning.
     Returns:
         matches, domains_array, n_ranges, range_size,
         tile_size, domain_step, energy_threshold, original_len
@@ -374,16 +423,13 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
 
     xp = cp if (use_gpu and GPU_WORKING) else np
 
-    # -------------------------
-    # Parameters
-    # -------------------------
     range_size = max(4, tile_size // 16)
     domain_step = max(1, range_size // 2)
 
     # -------------------------
     # Voiced detection
     # -------------------------
-    def voiced_detection(signal, frame_size=range_size * 2,
+    def voiced_detection(signal, frame_size=range_size*2,
                          energy_threshold=energy_thresh,
                          smooth_window=5,
                          low_threshold=None):
@@ -392,19 +438,14 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
         n = len(signal)
         n_frames = (n + frame_size - 1) // frame_size
         pad_len = n_frames * frame_size - n
-
         padded = np.pad(signal, (0, pad_len), mode='reflect')
         frames = padded.reshape(n_frames, frame_size)
-
         energies = np.mean(frames * frames, axis=1)
-
         if smooth_window > 1:
             kernel = np.ones(smooth_window, dtype=np.float32) / smooth_window
             energies = np.convolve(energies, kernel, mode='same')
-
         if low_threshold is None:
             low_threshold = energy_threshold * 0.5
-
         voiced_mask = np.zeros_like(energies, dtype=np.uint8)
         voiced = False
         for i, e in enumerate(energies):
@@ -413,7 +454,6 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
             elif e < low_threshold:
                 voiced = False
             voiced_mask[i] = 1 if voiced else 0
-
         return np.repeat(voiced_mask, frame_size)[:n]
 
     # -------------------------
@@ -441,123 +481,44 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
         signal, tile_size, range_size, domain_step,
         block_size=500, tmpdir=domains_tmpdir, use_gpu=use_gpu
     )
-
     if n_domains == 0:
         return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
                tile_size, domain_step, energy_thresh, original_len
 
-    d_means, d_vars = compute_stats_memmap(
-        domains_path, n_domains, range_size, batch_size=1024
-    )
-    cluster_ids, cluster_centers = build_domain_clusters(
-        d_means, d_vars, n_clusters=32
-    )
+    # Compute domain statistics & clusters
+    d_means, d_vars = compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024)
+    cluster_ids, cluster_centers = build_domain_clusters(d_means, d_vars, n_clusters=32)
 
-    if domains_path is None:
-        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
-               tile_size, domain_step, energy_thresh, original_len
-
-    domains_array = np.memmap(
-        domains_path, dtype='float32', mode='r',
-        shape=(n_domains, range_size)
-    )
-
+    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size)) # type: ignore
     domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
 
+    # -------------------------
+    # Worker: per-range hierarchical pruning + symmetry-aware affine
+    # -------------------------
+    def _process_range(idx):
+        r = ranges[idx]
+
+        # Pruned hierarchical matcher handles clusters, coarse distance, and exact solve
+        idx_d, s, o, sym_flag, err = find_best_domain_pruned( # type: ignore
+            r, domains_path, n_domains, range_size,
+            d_means, d_vars, cluster_ids, cluster_centers,
+            top_k_clusters=3, batch_size=1024, use_gpu=use_gpu
+        )
+
+        return (idx_d, float(s), float(o), int(sym_flag), float(err))
+
+    # -------------------------
+    # Parallel processing
+    # -------------------------
     matches = []
-    eps = 1e-12
+    with mp.Pool(mp.cpu_count()) as pool:
+        for res in pool.imap(_process_range, range(n_ranges), chunksize=batch_size):
+            matches.append(res)
 
     # -------------------------
-    # Process ranges in batches
+    # Cleanup
     # -------------------------
-    for start in range(0, n_ranges, batch_size):
-        end = min(start + batch_size, n_ranges)
-        ranges_block = ranges[start:end]
-        ranges_xp = xp.asarray(ranges_block) if (use_gpu and GPU_WORKING) else ranges_block
-
-        block_n = end - start
-
-        best_idxs = xp.empty(block_n, dtype=xp.int32)
-        best_scales = xp.empty(block_n, dtype=xp.float32)
-        best_offsets = xp.empty(block_n, dtype=xp.float32)
-        best_errs = xp.empty(block_n, dtype=xp.float32)
-        sym_flags = xp.zeros(block_n, dtype=xp.int8)
-
-        # ---- domain search (pruned)
-        for i, r in enumerate(ranges_xp):
-            idx, s, o, err = find_best_domain_pruned(
-                r,
-                domains_path,
-                n_domains,
-                range_size,
-                d_means,
-                d_vars,
-                cluster_ids,
-                cluster_centers,
-                batch_size=1024,
-                use_gpu=use_gpu
-            )
-
-            best_idxs[i] = idx
-            best_scales[i] = s
-            best_offsets[i] = o
-            best_errs[i] = err
-
-        # -------------------------
-        # Symmetry-aware affine correction (FIXED)
-        # -------------------------
-        selected = domains_xp[best_idxs]
-        mirrored = selected[:, ::-1]
-
-        for i in range(block_n):
-            r = ranges_xp[i]
-            r_mean = r.mean()
-            rc = r - r_mean
-
-            # original
-            d = selected[i]
-            dm = d.mean()
-            dc = d - dm
-            denom = xp.sum(dc * dc)
-            s0 = xp.sum(rc * dc) / denom if denom > eps else 0.0
-            o0 = r_mean - s0 * dm
-            err0 = xp.linalg.norm(r - (s0 * d + o0))
-
-            # mirrored
-            d2 = mirrored[i]
-            dm2 = d2.mean()
-            dc2 = d2 - dm2
-            denom2 = xp.sum(dc2 * dc2)
-            s1 = xp.sum(rc * dc2) / denom2 if denom2 > eps else 0.0
-            o1 = r_mean - s1 * dm2
-            err1 = xp.linalg.norm(r - (s1 * d2 + o1))
-
-            if err1 < err0:
-                sym_flags[i] = 1
-                best_scales[i] = s1
-                best_offsets[i] = o1
-                best_errs[i] = err1
-            else:
-                best_scales[i] = s0
-                best_offsets[i] = o0
-                best_errs[i] = err0
-
-        # -------------------------
-        # Store matches
-        # -------------------------
-        for i in range(block_n):
-            matches.append((
-                int(best_idxs[i]),
-                float(best_scales[i]),
-                float(best_offsets[i]),
-                int(sym_flags[i]),
-                float(best_errs[i])
-            ))
-
-    # -------------------------
-    # Finalize domains & cleanup
-    # -------------------------
-    domains_array = np.asarray(domains_array)
+    domains_array_cpu = np.asarray(domains_array)
     try:
         os.remove(domains_path) # type: ignore
     except Exception:
@@ -565,7 +526,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
 
     return (
         matches,
-        domains_array,
+        domains_array_cpu,
         n_ranges,
         range_size,
         tile_size,
