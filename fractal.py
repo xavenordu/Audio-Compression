@@ -118,6 +118,39 @@ def write_wav(path, data, framerate, sampwidth):
         w.setframerate(framerate)
         w.writeframes(out.tobytes())
 
+from scipy.fftpack import dct
+# ----------------------- Embedding helpers ----------------------- 
+EMBED_K = 16
+
+def tile_embedding(x, k=EMBED_K):
+    """
+    Compute shape embedding for a 1D tile.
+    - DCT-II, orthonormal
+    - DC excluded
+    - L2 normalized
+    """
+    x = np.asarray(x, dtype=np.float32)
+    v = dct(x, norm='ortho')
+    # Exclude DC term (v[0]) and take up to k coefficients; pad with zeros if needed
+    available = max(0, len(v) - 1)
+    take = min(k, available)
+    if take > 0:
+        e = v[1:1+take].astype(np.float32)
+    else:
+        e = np.zeros((0,), dtype=np.float32)
+
+    if take < k:
+        # pad to fixed size k
+        pad = np.zeros((k - take,), dtype=np.float32)
+        e = np.concatenate([e, pad])
+
+    # L2 normalize (if non-zero)
+    nrm = np.linalg.norm(e)
+    if nrm > 1e-8:
+        e = e / nrm
+    return e
+
+
 
 # ----------------------- Fractal helpers -----------------------
 
@@ -128,6 +161,50 @@ def frame_ranges(signal, range_size, hop=None):
     return np.vstack(ranges) if ranges else np.empty((0, range_size), dtype=signal.dtype)
 
 # ----------------------- Domain memmap building -----------------------
+
+def build_domain_embeddings(domains_path,
+                            n_domains,
+                            range_size,
+                            emb_dim=16,
+                            block_size=4096,
+                            tmpdir=None):
+    """
+    Build low-D DCT embeddings for each domain (memmap-backed).
+    Embedding input is the *downsampled domain* of length range_size.
+    """
+
+    emb_file = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix='.emb',
+        dir=tmpdir
+    )
+    emb_path = emb_file.name
+    emb_file.close()
+
+    domains_mm = np.memmap(
+        domains_path,
+        dtype='float32',
+        mode='r',
+        shape=(n_domains, range_size)
+    )
+
+    emb_mm = np.memmap(
+        emb_path,
+        dtype='float32',
+        mode='w+',
+        shape=(n_domains, emb_dim)
+    )
+
+    for i in range(0, n_domains, block_size):
+        b = domains_mm[i:i+block_size]
+        out = np.empty((len(b), emb_dim), dtype=np.float32)
+        for j, tile in enumerate(b):
+            out[j] = tile_embedding(tile, emb_dim)
+        emb_mm[i:i+len(out)] = out
+
+    emb_mm.flush()
+    return emb_path
+
 
 def build_domains_memmap(signal, tile_size, range_size, domain_step=1, block_size=1000, tmpdir=None, use_gpu=False):
     """
@@ -175,213 +252,90 @@ def build_domains_memmap(signal, tile_size, range_size, domain_step=1, block_siz
     return tmp_path, n_domains
 
 
-
-# ----------------------- Matching helpers (block-wise) -----------------------
-
-def compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024):
-    """Compute means and variances for domains stored in a memmap file in blocks."""
-    d_means = np.empty(n_domains, dtype=np.float32)
-    d_vars = np.empty(n_domains, dtype=np.float32)
-    domains_mm = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
-    idx = 0
-    for i in range(0, n_domains, batch_size):
-        b = domains_mm[i:i+batch_size]
-        means = b.mean(axis=1)
-        mean_sq = (b * b).mean(axis=1)
-        vars = mean_sq - means * means
-        vars = np.where(vars < 0, 0.0, vars)
-        d_means[idx:idx+len(means)] = means
-        d_vars[idx:idx+len(vars)] = vars
-        idx += len(means)
-    return d_means, d_vars
-
-def build_domain_clusters(d_means, d_vars, n_clusters=32, max_iter=25):
+def range_candidates_from_embedding(range_block,
+                                    domain_embs,
+                                    emb_dim=16,
+                                    top_k=64):
     """
-    K-means clustering over (mean, variance) space.
-    Returns:
-        cluster_ids: (n_domains,)
-        cluster_centers: (n_clusters, 2)
+    Fast candidate selection using embedding similarity.
+    Returns top_k domain indices sorted by descending similarity.
     """
-    feats = np.stack([d_means, d_vars], axis=1).astype(np.float32)
-    n_domains = feats.shape[0]
+    r_emb = tile_embedding(range_block, emb_dim)
 
-    # Init centers by sampling
-    rng = np.random.default_rng(0)
-    centers = feats[rng.choice(n_domains, size=n_clusters, replace=False)]
+    # cosine similarity (dot product)
+    scores = domain_embs @ r_emb  # (n_domains,)
 
-    for _ in range(max_iter):
-        # assign
-        dists = ((feats[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        labels = np.argmin(dists, axis=1)
+    if top_k >= len(scores):
+        idxs = np.argsort(-scores)
+    else:
+        idxs = np.argpartition(-scores, top_k)[:top_k]
+        idxs = idxs[np.argsort(-scores[idxs])]
 
-        # update
-        new_centers = np.zeros_like(centers)
-        for k in range(n_clusters):
-            members = feats[labels == k]
-            if len(members):
-                new_centers[k] = members.mean(axis=0)
-            else:
-                new_centers[k] = centers[k]
-
-        if np.allclose(centers, new_centers, atol=1e-6):
-            break
-        centers = new_centers
-
-    return labels.astype(np.int32), centers
+    return idxs.astype(np.int32)
 
 
-
-def find_best_domain_for_range_blockwise(range_block, domains_path, n_domains, range_size, d_means, d_vars, batch_size=1024, use_gpu=False):
-    """
-    Vectorized scan of domains stored in memmap file to find best matching domain for the given range_block.
-    Fully stays on GPU if requested; returns (best_idx, best_s, best_err)
-    """
+def find_best_domain_affine(range_block, domains_path, candidate_idxs, range_size, use_gpu=False):
     xp = cp if (use_gpu and GPU_WORKING) else np
-    domains_mm = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
-    
     rb = xp.asarray(range_block, dtype=xp.float32)
     rb_mean = float(rb.mean())
-    m = len(rb)
     sr2 = float((range_block**2).mean())
 
-    if use_gpu and GPU_WORKING:
-        best_err = cp.inf
-        best_idx = -1
-        best_s = 0.0
-    else:
-        best_err = float('inf')
-        best_idx = -1
-        best_s = 0.0
-
-    for i in range(0, n_domains, batch_size):
-        batch = domains_mm[i:i+batch_size]
-        batch_len = len(batch)
-
-        if use_gpu and GPU_WORKING:
-            batch_x = cp.asarray(batch, dtype=cp.float32)
-            d_means_batch = cp.asarray(d_means[i:i+batch_len], dtype=cp.float32)
-            d_vars_batch = cp.asarray(d_vars[i:i+batch_len], dtype=cp.float32)
-        else:
-            batch_x = batch.astype(np.float32)
-            d_means_batch = d_means[i:i+batch_len]
-            d_vars_batch = d_vars[i:i+batch_len]
-
-        # Vectorized scaling factor s
-        dots = batch_x.dot(rb)
-        denom = m * d_vars_batch
-        valid = denom > 1e-12
-        s = xp.zeros_like(denom)
-        s[valid] = (dots[valid] - m * d_means_batch[valid] * rb_mean) / denom[valid]
-
-        # Vectorized chi² calculation
-        chi2 = xp.full(batch_len, xp.inf, dtype=xp.float32)
-        if xp.any(valid):
-            chi2[valid] = sr2 + s[valid] * (s[valid]*d_vars_batch[valid] + 2*d_means_batch[valid]*rb_mean - 2*dots[valid]/m)
-
-        # Determine local best on GPU/CPU
-        local_best_idx = int(xp.argmin(chi2))
-        local_err = float(xp.sqrt(max(float(chi2[local_best_idx]), 0.0)))
-        local_s = float(s[local_best_idx])
-
-        if local_err < best_err:
-            best_err = local_err
-            best_idx = i + local_best_idx
-            best_s = local_s
-
-    return best_idx, best_s, best_err
-
-def find_best_domain_pruned(range_block,
-                            domains_path,
-                            n_domains,
-                            range_size,
-                            d_means,
-                            d_vars,
-                            cluster_ids,
-                            cluster_centers,
-                            top_k_clusters=3,
-                            coarse_downsample=4,
-                            top_k_domains=16,
-                            batch_size=1024,
-                            use_gpu=False):
-    """
-    Pruned hierarchical domain search using clusters with symmetry-aware affine correction.
-
-    Stages:
-      A) Cluster preselection (cheap: O(num_clusters))
-      B) Coarse distance (downsampled: O(K*range_size/coarse_downsample))
-      C) Exact affine solve with mirror check (O(K))
-
-    Returns:
-        best_idx, best_s, best_o, sym_flag, best_err
-    """
-
-    xp = cp if (use_gpu and GPU_WORKING) else np
-    r = xp.asarray(range_block, dtype=xp.float32)
-    r_mean = float(r.mean())
-    r_var = float(xp.var(r))
-    m = range_size
-    eps = 1e-12
-
-    # -------------------------
-    # Stage A: Cluster preselection
-    # -------------------------
-    feat = xp.array([r_mean, r_var], dtype=xp.float32)
-    centers = xp.asarray(cluster_centers, dtype=xp.float32)
-    dists = xp.sum((centers - feat)**2, axis=1)
-    best_clusters = xp.argsort(dists)[:top_k_clusters]
-
-    best_clusters_np = cp.asnumpy(best_clusters) if (use_gpu and GPU_WORKING) else best_clusters # type: ignore
-    candidate_idxs = np.where(np.isin(cluster_ids, best_clusters_np))[0]
-    if len(candidate_idxs) == 0:
-        return -1, 0.0, 0.0, 0, float('inf')
-
-    # -------------------------
-    # Stage B: Coarse downsampled distance
-    # -------------------------
-    ds = max(1, m // coarse_downsample)
-    r_ds = r[::ds]
-
-    domains_mm = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
-    coarse_errs = []
-    for idx in candidate_idxs:
-        d = domains_mm[int(idx)][::ds]
-        coarse_errs.append(xp.linalg.norm(r_ds - xp.asarray(d)))
-    coarse_errs = xp.asarray(coarse_errs)
-    k = min(top_k_domains, len(coarse_errs))
-    shortlist = candidate_idxs[xp.argsort(coarse_errs)[:k]]
-
-    # -------------------------
-    # Stage C: Exact affine solve + mirrored
-    # -------------------------
     best_err = float('inf')
     best_idx = -1
     best_s = 0.0
     best_o = 0.0
     sym_flag = 0
 
-    for idx in shortlist:
+    # If no candidates, return safe sentinel
+    if candidate_idxs is None or len(candidate_idxs) == 0:
+        return -1, 0.0, 0.0, 0, float('inf')
+
+    # Open a memmap for the full domains file (determine n_domains from file size)
+    try:
+        file_size = os.path.getsize(domains_path)
+        n_domains_file = file_size // (4 * range_size)
+    except Exception:
+        n_domains_file = None
+
+    if n_domains_file is not None:
+        domains_mm = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains_file, range_size))
+    else:
+        # Fallback: try to open without shape (may raise); keep previous behavior
+        domains_mm = np.memmap(domains_path, dtype='float32', mode='r')
+
+    # Filter out any invalid (negative) candidate indices
+    try:
+        candidate_list = [int(x) for x in candidate_idxs if int(x) >= 0]
+    except Exception:
+        candidate_list = [int(x) for x in candidate_idxs]
+
+    if len(candidate_list) == 0:
+        return -1, 0.0, 0.0, 0, float('inf')
+
+    for idx in candidate_list:
         tile = xp.asarray(domains_mm[int(idx)], dtype=xp.float32)
         tile_mean = float(tile.mean())
         tile_c = tile - tile_mean
-        r_c = r - r_mean
+        r_c = rb - rb_mean
         denom = float(xp.sum(tile_c * tile_c))
-        if denom < eps:
+        if denom < 1e-12:
             continue
+
         # Original
         s0 = float(xp.sum(r_c * tile_c) / denom)
-        o0 = r_mean - s0 * tile_mean
-        err0 = float(xp.linalg.norm(r - (s0*tile + o0)))
+        o0 = rb_mean - s0 * tile_mean
+        err0 = float(xp.linalg.norm(rb - (s0*tile + o0)))
 
         # Mirrored
         tile_m = tile[::-1]
         tile_m_mean = float(tile_m.mean())
         tile_m_c = tile_m - tile_m_mean
         denom_m = float(xp.sum(tile_m_c * tile_m_c))
-        if denom_m < eps:
+        if denom_m < 1e-12:
             continue
         s1 = float(xp.sum(r_c * tile_m_c) / denom_m)
-        o1 = r_mean - s1 * tile_m_mean
-        err1 = float(xp.linalg.norm(r - (s1*tile_m + o1)))
+        o1 = rb_mean - s1 * tile_m_mean
+        err1 = float(xp.linalg.norm(rb - (s1*tile_m + o1)))
 
         if err1 < err0:
             err = err1
@@ -402,6 +356,124 @@ def find_best_domain_pruned(range_block,
             sym_flag = sym
 
     return best_idx, best_s, best_o, sym_flag, best_err
+
+
+# ---------------- CPU worker ----------------
+def cpu_worker(idx_slice, ranges, domain_embs_path, n_domains, range_size, emb_dim, candidate_queue, 
+               energy_thresh=1e-4, fast_mode=True, batch_size=32):
+    """
+    CPU worker: selects candidate domains for a batch of ranges and pushes them to the GPU queue.
+    """
+    # Load domain embeddings once per worker
+    domain_embs = np.memmap(domain_embs_path, dtype='float32', mode='r', shape=(n_domains, emb_dim))
+    
+    batch_idxs = []
+    batch_candidates = []
+    batch_ranges = []
+
+    for idx in idx_slice:
+        r = ranges[idx]
+        if fast_mode and np.mean(r**2) < energy_thresh * 0.75:
+            candidate_idxs = []  # empty candidate
+        else:
+            candidate_idxs = range_candidates_from_embedding(r, domain_embs, top_k=32)
+        
+        batch_idxs.append(idx)
+        batch_candidates.append(candidate_idxs)
+        batch_ranges.append(r)
+
+        # When batch is full, push to queue
+        if len(batch_idxs) >= batch_size:
+            candidate_queue.put(list(zip(batch_idxs, batch_candidates, batch_ranges)))
+            batch_idxs, batch_candidates, batch_ranges = [], [], []
+
+    # Push any remaining items
+    if batch_idxs:
+        candidate_queue.put(list(zip(batch_idxs, batch_candidates, batch_ranges)))
+
+    # Sentinel for this worker
+    candidate_queue.put(None)
+
+
+# ---------------- GPU worker ----------------
+def gpu_worker(candidate_queue, domains_path, range_size, results_queue, use_gpu=True, batch_size=16, num_cpu_workers=None):
+    """
+    Batched GPU worker: collects multiple ranges from candidate_queue,
+    performs vectorized affine solves on GPU, and puts results into results_queue.
+    """
+    active_workers = 0
+    batch = []
+    xp = cp if (use_gpu and GPU_WORKING) else np
+
+    # Load domains memmap once (determine n_domains from file size)
+    domains_xp = None
+    if domains_path is not None:
+        try:
+            file_size = os.path.getsize(domains_path)
+            n_domains_file = file_size // (4 * range_size)
+            domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains_file, range_size))
+            domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
+        except Exception:
+            domains_xp = None
+
+    while True:
+        try:
+            item = candidate_queue.get(timeout=0.1)
+        except Exception:
+            item = None
+
+        if item is None:
+            active_workers += 1
+            if active_workers == num_cpu_workers:
+                # Process any remaining batch
+                if batch:
+                    _process_gpu_batch(batch, domains_xp, results_queue) # type: ignore
+                break
+            continue
+
+        batch.append(item)
+
+        if len(batch) >= batch_size:
+            _process_gpu_batch(batch, domains_xp, results_queue) # type: ignore
+            batch.clear()
+
+
+def _process_gpu_batch(batch, domains_xp, results_queue, use_gpu=True):
+    """
+    Process a batch of ranges on GPU (or CPU if use_gpu=False).
+    """
+    if not batch:
+        return
+
+    xp = cp if (use_gpu and GPU_WORKING) else np
+    # Flatten the nested batch (each item may itself be a list of tuples)
+    flat = [item for sub in batch for item in (sub if isinstance(sub, (list, tuple)) and not isinstance(sub[0], (int,)) else [sub])]
+    # Each flat item is expected to be (idx, candidate_idxs, range_block)
+    batch_idxs = [b[0] for b in flat]
+    batch_candidate_idxs = [b[1] for b in flat]
+    batch_ranges = [b[2] for b in flat]
+
+    n_ranges = len(flat)
+    n_candidates_max = max((len(c) for c in batch_candidate_idxs), default=0)
+    if n_candidates_max == 0:
+        # All empty candidates
+        for idx in batch_idxs:
+            results_queue.put((idx, (-1, 1.0, 0.0, 0, 0.0)))
+        return
+    # Ensure domains_xp is available
+    if domains_xp is None:
+        for idx in batch_idxs:
+            results_queue.put((idx, (-1, 1.0, 0.0, 0, 0.0)))
+        return
+
+    # Process each range in batch
+    for idx, candidates, r in zip(batch_idxs, batch_candidate_idxs, batch_ranges):
+        if not candidates:
+            results_queue.put((idx, (-1, 1.0, 0.0, 0, 0.0)))
+            continue
+        # Call the existing exact_affine_gpu function
+        res = exact_affine_gpu(r, candidates, domains_xp)
+        results_queue.put((idx, res))
 
 # ----------------------- Symmetry -----------------------
 
@@ -444,42 +516,93 @@ def voiced_detection(signal, frame_size=64, energy_threshold=1e-4, smooth_window
 
 
 # ---------------- Top-level worker for multiprocessing ----------------
-def _process_range(idx, ranges, domains_path, n_domains, range_size,
-                   d_means, d_vars, cluster_ids, cluster_centers, batch_size=1024, use_gpu=False):
+def exact_affine_gpu(range_block, domain_idxs, domains_xp):
     """
-    Worker function to process a single range for fractal compression.
+    Batched GPU affine solve for one range and many candidate domains.
+    """
+    r = cp.asarray(range_block)
+    tiles = domains_xp[domain_idxs]          # shape: (num_candidates, range_size)
+    tiles_m = tiles[:, ::-1]                  # mirrored tiles
+
+    best_err = cp.inf
+    best_result = None
+
+    for tiles_cur, sym in [(tiles, 0), (tiles_m, 1)]:
+        mean_d = tiles_cur.mean(axis=1)
+        d_c = tiles_cur - mean_d[:, None]
+        r_mean = r.mean()
+        r_c = r - r_mean
+
+        denom = cp.sum(d_c * d_c, axis=1)
+        valid = denom > 1e-8
+
+        s = cp.zeros_like(denom)
+        s[valid] = cp.sum(d_c[valid] * r_c, axis=1) / denom[valid]
+        o = r_mean - s * mean_d
+
+        recon = s[:, None] * tiles_cur + o[:, None]
+        err = cp.linalg.norm(recon - r, axis=1)
+
+        i = int(cp.argmin(err))
+        if err[i] < best_err:
+            best_err = err[i]
+            best_result = (int(domain_idxs[i]), float(s[i]), float(o[i]), sym, float(err[i]))
+
+    return best_result
+
+def _process_range(idx, ranges, domains_path, domain_embs_path, n_domains, range_size, emb_dim=16, use_gpu=False, domains_gpu=None):
+    """
+    Worker function for one range. Uses embedding shortlist and optionally GPU affine solve.
     """
     r = ranges[idx]
 
-    # Pruned hierarchical matcher handles clusters, coarse distance, and exact solve
-    idx_d, s, o, sym_flag, err = find_best_domain_pruned(
-        r, domains_path, n_domains, range_size,
-        d_means, d_vars, cluster_ids, cluster_centers,
-        top_k_clusters=3, batch_size=batch_size, use_gpu=use_gpu
-    )
+    if domain_embs_path is None:
+        return -1, 0.0, 0.0, 0, float('inf')
 
-    return (idx_d, float(s), float(o), int(sym_flag), float(err))
+    domain_embs = np.memmap(domain_embs_path, dtype='float32', mode='r', shape=(n_domains, emb_dim))
+    candidate_idxs = range_candidates_from_embedding(r, domain_embs, top_k=32)
+    if candidate_idxs is None or len(candidate_idxs) == 0:
+        return -1, 0.0, 0.0, 0, float('inf')
 
+    if use_gpu and domains_gpu is not None:
+        return exact_affine_gpu(r, candidate_idxs, domains_gpu)
+    else:
+        return find_best_domain_affine(r, domains_path, candidate_idxs, range_size, use_gpu=False)
 
-# ---------------- compress_audio ----------------
+def _worker_batch(idx_slice, ranges, domains_path, domain_embs_path, n_domains, range_size,
+                  use_gpu=False, domains_gpu=None, energy_thresh=1e-4, fast_mode=True):
+    results = []
+    for idx in idx_slice:
+        r = ranges[idx]
+        if fast_mode and np.mean(r**2) < energy_thresh*0.75:  # skip very silent ranges
+            results.append((-1, 1.0, 0.0, 0, 0.0))
+            continue
+        res = _process_range(idx, ranges, domains_path, domain_embs_path, n_domains, range_size,
+                             use_gpu=use_gpu, domains_gpu=domains_gpu)
+        results.append(res)
+    return results
+
 def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1e-4,
-                   use_gpu=False, domains_tmpdir=None, batch_size=512):
+                   use_gpu=False, domains_tmpdir=None, batch_size=512, fast_mode=True):
     """
-    Compress audio using fractal domain matching with safe multiprocessing.
-    Returns:
-        matches, domains_array, n_ranges, range_size,
-        tile_size, domain_step, energy_threshold, original_len
+    Compress audio using fractal domain matching with **pipeline parallelism**.
+    CPU: candidate selection via embeddings
+    GPU: exact affine solve in batches
     """
     xp = cp if (use_gpu and GPU_WORKING) else np
 
-    range_size = max(4, tile_size // 16)
+    range_size = max(4, tile_size // 64)
     domain_step = max(1, range_size // 2)
 
     # ---------------- Voiced detection ----------------
     voiced_mask = voiced_detection(signal, frame_size=range_size*2, energy_threshold=energy_thresh)
     weighted_signal = signal * voiced_mask
-
     original_len = len(weighted_signal)
+
+    if np.sum(weighted_signal**2) < 1e-8:
+        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
+               tile_size, domain_step, energy_thresh, original_len
+
     pad_len = (range_size - (original_len % range_size)) % range_size
     if pad_len:
         weighted_signal = np.pad(weighted_signal, (0, pad_len), mode='reflect')
@@ -494,35 +617,64 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
     # ---------------- Build domains (memmap) ----------------
     domains_path, n_domains = build_domains_memmap(
         signal, tile_size, range_size, domain_step,
-        block_size=500, tmpdir=domains_tmpdir, use_gpu=use_gpu
+        block_size=500, tmpdir=domains_tmpdir, use_gpu=(use_gpu and GPU_WORKING)
     )
     if n_domains == 0:
         return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, \
                tile_size, domain_step, energy_thresh, original_len
 
-    d_means, d_vars = compute_stats_memmap(domains_path, n_domains, range_size, batch_size=1024)
-    cluster_ids, cluster_centers = build_domain_clusters(d_means, d_vars, n_clusters=32)
+    # Domain stats / clustering removed: embeddings (ANN) are used for shortlist
 
-    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
+    # Load domains into CPU or GPU
+    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size)) # type: ignore
     domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
 
-    # ---------------- Parallel processing ----------------
-    matches = []
-    import multiprocessing as mp
-    args_list = [
-        (i, ranges, domains_path, n_domains, range_size,
-         d_means, d_vars, cluster_ids, cluster_centers, batch_size, use_gpu)
-        for i in range(n_ranges)
+    # ---------------- Build domain embeddings (memmap) ----------------
+    emb_path = build_domain_embeddings(domains_path, n_domains, range_size, emb_dim=EMBED_K, block_size=4096, tmpdir=domains_tmpdir)
+
+    # ---------------- Pipeline parallelism ----------------
+    manager = mp.Manager()
+    candidate_queue = manager.Queue(maxsize=64)  # CPU → GPU queue
+    results_queue = manager.Queue()
+
+    num_cpu_workers = mp.cpu_count()
+    cpu_slices = np.array_split(np.arange(n_ranges), num_cpu_workers)
+
+    # Start CPU workers
+    cpu_processes = [
+        mp.Process(target=cpu_worker,
+                   args=(sl, ranges, emb_path, n_domains, range_size, EMBED_K, candidate_queue, energy_thresh, fast_mode))
+        for sl in cpu_slices
     ]
 
-    with mp.Pool(mp.cpu_count()) as pool:
-        results = pool.starmap(_process_range, args_list)
-        matches.extend(results)
+    # Start batched GPU worker
+    gpu_process = mp.Process(target=gpu_worker,
+                             args=(candidate_queue, domains_path, range_size, results_queue, use_gpu, batch_size, num_cpu_workers))
 
-    # ---------------- Cleanup ----------------
+    for p in cpu_processes:
+        p.start()
+    gpu_process.start()
+
+    # ---------------- Collect results ----------------
+    matches = [None] * n_ranges
+    finished = 0
+    while finished < n_ranges:
+        idx, res = results_queue.get()
+        matches[idx] = res
+        finished += 1
+
+    # Cleanup
+    for p in cpu_processes:
+        p.join()
+    gpu_process.join()
+
+    # Convert domains to CPU array for saving
     domains_array_cpu = np.asarray(domains_array)
+
+    # Remove temporary files
     try:
-        os.remove(domains_path)
+        if domains_path: os.remove(domains_path)
+        if emb_path: os.remove(emb_path)
     except Exception:
         pass
 
@@ -537,6 +689,7 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
         original_len
     )
 
+# ---------------- save/load compressed ----------------
 
 def save_compressed(filepath, matches, domains_array, range_size, framerate, sampwidth,
                     tile_size, domain_step, energy_threshold, original_len):
@@ -573,9 +726,9 @@ def save_compressed(filepath, matches, domains_array, range_size, framerate, sam
             f.write(b)
             sha.update(b)
 
-        # Write matches
+        # Write matches (use signed domain indices to allow -1 sentinel)
         for m in matches:
-            b = struct.pack('<IffBf', int(m[0]), float(m[1]), float(m[2]), int(m[3]), float(m[4]))
+            b = struct.pack('<iffBf', int(m[0]), float(m[1]), float(m[2]), int(m[3]), float(m[4]))
             f.write(b)
             sha.update(b)
 
@@ -622,7 +775,7 @@ def load_compressed(filepath, verify_checksum=True):
         matches = []
         for _ in range(n_ranges):
             b = f.read(17)
-            m = struct.unpack('<IffBf', b)
+            m = struct.unpack('<iffBf', b)
             matches.append(m)
             if verify_checksum:
                 sha.update(b) # type: ignore
@@ -658,6 +811,14 @@ def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8,
 
     domains_xp = xp.asarray(domains_array, dtype=xp.float32) if (use_gpu and GPU_WORKING) else domains_array
 
+    # Handle sentinel -1 domain indices used for skipped/unvoiced ranges: mask them
+    invalid_mask = domain_indices < 0
+    if invalid_mask.any():
+        # Use a cleaned indices array to avoid indexing errors; set invalid tiles to zero later
+        domain_indices_clean = domain_indices.copy()
+        domain_indices_clean[invalid_mask] = 0
+        domain_indices = domain_indices_clean
+
     starts = xp.arange(n_ranges, dtype=xp.int32) * range_size
     scatter_idx = xp.repeat(starts, range_size) + xp.tile(xp.arange(range_size, dtype=xp.int32), n_ranges)
     counts_flat = xp.ones(n_ranges * range_size, dtype=xp.float32)
@@ -667,6 +828,19 @@ def decompress_audio(matches, domains_array, n_ranges, range_size, iterations=8,
         recon_ranges = recon.reshape(n_ranges, range_size)
 
         tiles = domains_xp[domain_indices]
+
+        # For entries that had sentinel -1, ensure their tiles are all zeros
+        if 'invalid_mask' in locals() and invalid_mask.any():
+            # zero-out the tiles and corresponding stored parameters so they contribute nothing
+            tiles = xp.array(tiles, copy=True)
+            tiles[invalid_mask] = 0
+            s_stored = s_stored.copy()
+            o_stored = o_stored.copy()
+            s_stored[invalid_mask] = 0.0
+            o_stored[invalid_mask] = 0.0
+            sym_flags = sym_flags.copy()
+            sym_flags[invalid_mask] = False
+
         if sym_flags.any():
             tiles = xp.where(sym_flags[:, None], tiles[:, ::-1], tiles)
 
