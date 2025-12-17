@@ -58,6 +58,21 @@ else:
 
 FWAV_VERSION = 1
 
+# ANN libraries (optional)
+try:
+    import hnswlib  # type: ignore
+    HNSW_AVAILABLE = True
+except Exception:
+    hnswlib = None
+    HNSW_AVAILABLE = False
+
+try:
+    import faiss  # type: ignore
+    FAISS_AVAILABLE = True
+except Exception:
+    faiss = None
+    FAISS_AVAILABLE = False
+
 # ----------------------- I/O helpers -----------------------
 
 def read_wav_mono(path, mmap=False):
@@ -274,6 +289,57 @@ def range_candidates_from_embedding(range_block,
     return idxs.astype(np.int32)
 
 
+def build_ann_index(emb_path, n_domains, emb_dim=EMBED_K, index_path=None, method='hnsw', ef=200, M=16):
+    """Build an ANN index for embeddings stored in `emb_path` memmap.
+    Returns path to saved index file or None if index couldn't be built.
+    """
+    if method == 'hnsw' and not HNSW_AVAILABLE:
+        return None
+    if index_path is None:
+        index_path = emb_path + '.ann'
+
+    # load embeddings
+    try:
+        emb_mm = np.memmap(emb_path, dtype='float32', mode='r', shape=(n_domains, emb_dim))
+        data = np.asarray(emb_mm)
+    except Exception:
+        try:
+            data = np.fromfile(emb_path, dtype=np.float32).reshape(n_domains, emb_dim)
+        except Exception:
+            return None
+
+    if method == 'hnsw' and HNSW_AVAILABLE:
+        p = hnswlib.Index(space='ip', dim=emb_dim)
+        p.init_index(max_elements=n_domains, ef_construction=ef, M=M)
+        p.add_items(data, np.arange(n_domains))
+        p.set_ef(50)
+        p.save_index(index_path)
+        return index_path
+
+    # FAISS path can be added here (not implemented by default)
+    return None
+
+
+def ann_query(range_block, index_path, top_k=64, emb_dim=EMBED_K):
+    """Query saved ANN index and return candidate ids (np.int32).
+    Returns empty array on failure.
+    """
+    if index_path is None:
+        return np.empty((0,), dtype=np.int32)
+    if HNSW_AVAILABLE:
+        try:
+            idx = hnswlib.Index(space='ip', dim=emb_dim)
+            idx.load_index(index_path)
+            q = tile_embedding(range_block, k=emb_dim)
+            labels, dists = idx.knn_query(q.astype(np.float32), k=top_k)
+            return np.asarray(labels[0], dtype=np.int32)
+        except Exception:
+            return np.empty((0,), dtype=np.int32)
+
+    # FAISS or other backends could be added here
+    return np.empty((0,), dtype=np.int32)
+
+
 def find_best_domain_affine(range_block, domains_path, candidate_idxs, range_size, use_gpu=False):
     xp = cp if (use_gpu and GPU_WORKING) else np
     rb = xp.asarray(range_block, dtype=xp.float32)
@@ -359,8 +425,8 @@ def find_best_domain_affine(range_block, domains_path, candidate_idxs, range_siz
 
 
 # ---------------- CPU worker ----------------
-def cpu_worker(idx_slice, ranges, domain_embs_path, n_domains, range_size, emb_dim, candidate_queue, 
-               energy_thresh=1e-4, fast_mode=True, batch_size=32):
+def cpu_worker(idx_slice, ranges, domain_embs_path, n_domains, range_size, emb_dim, candidate_queue,
+               ann_index_path=None, energy_thresh=1e-4, fast_mode=True, batch_size=32):
     """
     CPU worker: selects candidate domains for a batch of ranges and pushes them to the GPU queue.
     """
@@ -371,12 +437,38 @@ def cpu_worker(idx_slice, ranges, domain_embs_path, n_domains, range_size, emb_d
     batch_candidates = []
     batch_ranges = []
 
+    # Load ANN index once per worker process (if available)
+    ann_index = None
+    if ann_index_path is not None and HNSW_AVAILABLE:
+        try:
+            ann_index = hnswlib.Index(space='ip', dim=emb_dim)
+            ann_index.load_index(ann_index_path)
+            # set ef for queries; can be tuned
+            try:
+                ann_index.set_ef(50)
+            except Exception:
+                pass
+        except Exception:
+            ann_index = None
+
     for idx in idx_slice:
         r = ranges[idx]
         if fast_mode and np.mean(r**2) < energy_thresh * 0.75:
             candidate_idxs = []  # empty candidate
         else:
-            candidate_idxs = range_candidates_from_embedding(r, domain_embs, top_k=32)
+            candidate_idxs = None
+            # Try ANN query first if index loaded in this worker
+            if ann_index is not None:
+                try:
+                    q = tile_embedding(r, k=emb_dim).astype(np.float32)
+                    labels, dists = ann_index.knn_query(q.reshape(1, -1), k=32)
+                    candidate_idxs = np.asarray(labels[0], dtype=np.int32)
+                except Exception:
+                    candidate_idxs = None
+
+            # Fallback to linear search
+            if candidate_idxs is None or (hasattr(candidate_idxs, '__len__') and len(candidate_idxs) == 0):
+                candidate_idxs = range_candidates_from_embedding(r, domain_embs, top_k=32)
         
         batch_idxs.append(idx)
         batch_candidates.append(candidate_idxs)
@@ -468,7 +560,8 @@ def _process_gpu_batch(batch, domains_xp, results_queue, use_gpu=True):
 
     # Process each range in batch
     for idx, candidates, r in zip(batch_idxs, batch_candidate_idxs, batch_ranges):
-        if not candidates:
+        # candidates may be a numpy array; avoid ambiguous truth value
+        if candidates is None or (hasattr(candidates, '__len__') and len(candidates) == 0):
             results_queue.put((idx, (-1, 1.0, 0.0, 0, 0.0)))
             continue
         # Call the existing exact_affine_gpu function
@@ -641,9 +734,19 @@ def compress_audio(signal, framerate, sampwidth, tile_size=1024, energy_thresh=1
     cpu_slices = np.array_split(np.arange(n_ranges), num_cpu_workers)
 
     # Start CPU workers
+    # Optionally build ANN index for large domain sets (done once in parent)
+    ann_index_path = None
+    try:
+        if n_domains > 4096 and HNSW_AVAILABLE:
+            ann_index_path = build_ann_index(emb_path, n_domains, emb_dim=EMBED_K, method='hnsw')
+            if ann_index_path:
+                logger.info(f'[FWAVC] Built HNSW ANN index at {ann_index_path}')
+    except Exception:
+        ann_index_path = None
+
     cpu_processes = [
         mp.Process(target=cpu_worker,
-                   args=(sl, ranges, emb_path, n_domains, range_size, EMBED_K, candidate_queue, energy_thresh, fast_mode))
+                   args=(sl, ranges, emb_path, n_domains, range_size, EMBED_K, candidate_queue, ann_index_path, energy_thresh, fast_mode))
         for sl in cpu_slices
     ]
 
