@@ -138,7 +138,7 @@ def write_wav(path, data, framerate, sampwidth):
 
 from scipy.fftpack import dct
 # ----------------------- Embedding helpers ----------------------- 
-EMBED_K = 64  # number of DCT coefficients for tile embedding
+EMBED_K = 32  # number of DCT coefficients for tile embedding
 
 from scipy.fftpack import dct
 
@@ -207,6 +207,14 @@ def tile_embedding(x, k=EMBED_K):
         e = e / nrm
     return e
 
+def quick_energy(x):
+    return float(np.sum(x * x))
+
+def correlation_upper_bound(r_c, d_c, r_norm, d_norm):
+    # |corr| ≤ 1
+    if d_norm < 1e-12 or r_norm < 1e-12:
+        return 0.0
+    return abs(float(np.dot(r_c, d_c))) / (r_norm * d_norm)
 
 
 # ----------------------- Fractal helpers -----------------------
@@ -571,119 +579,252 @@ def cpu_worker(idx_slice, ranges, domain_embs_path, n_domains, range_size, emb_d
 
 
 # ---------------- GPU worker ----------------
-def gpu_worker(candidate_queue, domains_path, range_size, results_queue, use_gpu=True,
-               batch_size=16, num_cpu_workers=None, transient_weight=1.0, n_mels=40,
-               mel_fb=None, transient_masks=None):
-    import logging
+def gpu_worker(
+    candidate_queue,
+    domains_path,
+    range_size,
+    results_queue,
+    use_gpu=True,
+    batch_size=16,
+    num_cpu_workers=None,
+    transient_weight=1.0,
+    n_mels=40,
+    mel_fb=None,
+    transient_masks=None,
+):
+    """
+    Robust GPU worker process for fractal audio compression.
+    Safely integrates _process_gpu_batch and handles CPU sentinels.
+    """
+    import logging, os, time
     logging.basicConfig(level=logging.INFO)
-    
-    xp = cp if (use_gpu and GPU_WORKING) else np
-    batch = []
-    active_workers = 0
+    logger = logging.getLogger("gpu_worker")
 
-    # ---------------- Load domains memmap ----------------
+    xp = cp if (use_gpu and "cp" in globals() and GPU_WORKING) else np
+    batch = []
+
+    finished_workers = 0
+    expected_workers = num_cpu_workers or 0
+
+    # ---------------- Load domains safely ----------------
     domains_xp = None
-    if domains_path is not None:
+    if domains_path:
         try:
             file_size = os.path.getsize(domains_path)
             n_domains_file = file_size // (4 * range_size)
-            domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains_file, range_size))
+            domains_array = np.memmap(
+                domains_path,
+                dtype="float32",
+                mode="r",
+                shape=(n_domains_file, range_size),
+            )
             domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
+            logger.info(f"[GPU Worker] Loaded domains: {domains_xp.shape}")
         except Exception as e:
-            logging.warning(f"[GPU Worker] Failed to load domains memmap: {e}")
+            logger.warning(f"[GPU Worker] Failed to load domains memmap: {e}")
             domains_xp = None
 
-    # ---------------- Batch processing loop ----------------
+    # ---------------- Main loop ----------------
     while True:
         try:
             item = candidate_queue.get(timeout=0.1)
         except Exception:
-            item = None
+            continue
 
-        if item is None:
-            active_workers += 1
-            if active_workers >= (num_cpu_workers or 0):
+        if item is None:  # sentinel from CPU worker
+            finished_workers += 1
+            logger.debug(f"[GPU Worker] Received sentinel ({finished_workers}/{expected_workers})")
+            if finished_workers >= expected_workers:
+                # Process any remaining batch before shutdown
                 if batch:
-                    _process_gpu_batch(
-                        batch,
-                        domains_xp,
-                        results_queue,
-                        use_gpu=use_gpu,
-                        transient_weight=transient_weight,
-                        n_mels=n_mels,
-                        mel_fb=mel_fb,
-                        transient_masks=transient_masks
-                    )
+                    try:
+                        _process_gpu_batch(batch, domains_xp, results_queue,
+                                           use_gpu=use_gpu, transient_weight=transient_weight)
+                    except Exception as e:
+                        logger.error(f"[GPU Worker] Error processing final batch: {e}")
+                    batch.clear()
+                logger.info("[GPU Worker] All CPU workers finished. Exiting.")
                 break
             continue
 
+        # Append item and process if batch is full
         batch.append(item)
         if len(batch) >= batch_size:
-            _process_gpu_batch(
-                batch,
-                domains_xp,
-                results_queue,
-                use_gpu=use_gpu,
-                transient_weight=transient_weight,
-                n_mels=n_mels,
-                mel_fb=mel_fb,
-                transient_masks=transient_masks
-            )
+            try:
+                _process_gpu_batch(batch, domains_xp, results_queue,
+                                   use_gpu=use_gpu, transient_weight=transient_weight)
+            except Exception as e:
+                logger.error(f"[GPU Worker] Error processing batch: {e}")
             batch.clear()
 
-def _process_gpu_batch(batch, domains_xp, results_queue, use_gpu=True,
-                       transient_weight=1.0, n_mels=40, mel_fb=None, transient_masks=None):
-    if not batch:
+    # ---------------- Drain remaining items from queue ----------------
+    while not candidate_queue.empty():
+        try:
+            item = candidate_queue.get_nowait()
+            if item is not None:
+                batch.append(item)
+        except Exception:
+            break
+
+    if batch:
+        try:
+            _process_gpu_batch(batch, domains_xp, results_queue,
+                               use_gpu=use_gpu, transient_weight=transient_weight)
+        except Exception as e:
+            logger.error(f"[GPU Worker] Error processing remaining items: {e}")
+        batch.clear()
+
+    logger.info("[GPU Worker] Shutdown complete.")
+
+
+def _process_gpu_batch(
+    batch,
+    domains_xp,
+    results_queue,
+    use_gpu=True,
+    transient_weight=1.0,
+    s_clip=16.0,
+):
+    """
+    Fully robust GPU/CPU batch processing for fractal audio compression.
+    Handles variable-length ranges and domains, dynamic per-range weights,
+    and avoids broadcasting errors.
+    """
+    xp = cp if (use_gpu and "cp" in globals()) else np
+
+    if len(batch) == 0:
         return
 
-    xp = cp if (use_gpu and GPU_WORKING) else np
+    # ---------------- Flatten nested batch ----------------
+    flat_batch = []
+    for item in batch:
+        if isinstance(item, tuple) and len(item) == 3 and isinstance(item[0], (int, np.integer)):
+            flat_batch.append(item)
+        elif isinstance(item, (list, tuple)):
+            for subitem in item:
+                if not (isinstance(subitem, tuple) and len(subitem) == 3):
+                    raise ValueError(f"Invalid batch element: {subitem}")
+                flat_batch.append(subitem)
+        else:
+            raise ValueError(f"Invalid batch element: {item}")
+    batch = flat_batch
 
-    # Flatten batch structure
-    flat = [
-        item for sub in batch
-        for item in (sub if isinstance(sub, (list, tuple)) and not isinstance(sub[0], (int,)) else [sub])
-    ]
-    batch_idxs = [b[0] for b in flat]
-    batch_candidate_idxs = [b[1] for b in flat]
-    batch_ranges = [b[2] for b in flat]
-
-    if domains_xp is None:
-        for idx in batch_idxs:
-            # Return default "no match" result
-            results_queue.put((idx, (-1, 1.0, 0.0, 0, 0.0)))
+    B = len(batch)
+    if B == 0:
         return
 
-    for i, (idx, candidates, r) in enumerate(zip(batch_idxs, batch_candidate_idxs, batch_ranges)):
-        if not candidates:
-            results_queue.put((idx, (-1, 1.0, 0.0, 0, 0.0)))
-            continue
+    # ---------------- Safe range indices ----------------
+    def safe_range_idx(item):
+        idx = item[0]
+        if isinstance(idx, (tuple, list, np.ndarray)):
+            if len(idx) != 1:
+                raise ValueError(f"Unexpected range index: {item}")
+            idx = idx[0]
+        return int(idx)
 
-        candidate_tiles = domains_xp[candidates]  # (n_candidates, range_size)
-        t_mask = transient_masks[i] if transient_masks is not None else None
+    range_idxs = xp.array([safe_range_idx(item) for item in batch], dtype=xp.int32)
+    ranges_list = [xp.asarray(item[1], dtype=xp.float32) for item in batch]
+    domain_idxs_list = [xp.asarray(item[2], dtype=xp.int32) for item in batch]
 
-        # ---------------- Select best candidate ----------------
-        scores = perceptual_error_batch(
-            candidate_tiles, r,
-            mel_fb=mel_fb,
-            transient_mask=t_mask,
-            transient_weight=transient_weight,
-            use_gpu=use_gpu
-        )
-        best_idx = int(xp.argmin(scores))
-        best_candidate_idx = candidates[best_idx]
+    # ---------------- Max lengths ----------------
+    max_N = max(r.shape[0] for r in ranges_list)
+    max_D = max(d.shape[0] for d in domain_idxs_list)
 
-        # ---------------- Compute exact affine parameters ----------------
-        affine_params = exact_affine_gpu(
-            r,
-            [best_candidate_idx],
-            domains_xp,
-            transient_weight=transient_weight,
-            mel_weights=mel_fb,
-            transient_mask=t_mask,
-            use_gpu=use_gpu
-        )
+    # ---------------- Pad ranges ----------------
+    ranges = xp.stack([xp.pad(r, (0, max_N - r.shape[0]), mode='constant') for r in ranges_list], axis=0)
 
-        results_queue.put((idx, affine_params))
+    # ---------------- Pad domains and gather ----------------
+    domain_idxs = xp.stack([xp.pad(d, (0, max_D - d.shape[0]), constant_values=-1) for d in domain_idxs_list], axis=0)
+    domain_idxs_safe = domain_idxs.copy()
+    domain_idxs_safe[domain_idxs_safe < 0] = 0
+
+    # Gather domains and pad to max_N if needed
+    domains_list = []
+    for b in range(B):
+        domains_b = domains_xp[domain_idxs_safe[b]]  # (D, range_size)
+        D_b, N_b = domains_b.shape
+        if N_b < max_N:
+            domains_b = xp.pad(domains_b, ((0,0),(0,max_N - N_b)), mode='constant')
+        else:
+            domains_b = domains_b[:,:max_N]
+        domains_list.append(domains_b)
+    domains = xp.stack(domains_list, axis=0)  # (B, D, max_N)
+
+    # ---------------- Symmetry ----------------
+    domains_rev = domains[:, :, ::-1]
+    domains_sym = xp.concatenate([domains, domains_rev], axis=1)
+    sym_flags = xp.concatenate([xp.zeros((B, max_D), dtype=xp.int8), xp.ones((B, max_D), dtype=xp.int8)], axis=1)
+    domain_idxs_sym = xp.concatenate([domain_idxs_safe, domain_idxs_safe], axis=1)
+
+    # ---------------- Range statistics ----------------
+    r_mean = xp.mean(ranges, axis=1, keepdims=True)
+    r_c = ranges - r_mean
+    r_energy = xp.sum(r_c * r_c, axis=1, keepdims=True)
+    r_norm = xp.sqrt(r_energy) + 1e-12
+
+    # ---------------- Domain correlation ----------------
+    d_mean = xp.mean(domains_sym, axis=2, keepdims=True)
+    d_c = domains_sym - d_mean
+    d_energy = xp.sum(d_c * d_c, axis=2, keepdims=True)
+    d_norm = xp.sqrt(d_energy) + 1e-12
+    ratio = d_energy / (r_energy[:, None, :] + 1e-12)
+    mask_energy = (ratio > 0.25) & (ratio < 4.0)
+    corr = xp.abs(xp.sum(d_c * r_c[:, None, :], axis=2, keepdims=True)) / (r_norm[:, None, :] * d_norm)
+    min_err = r_norm[:, None, :] * xp.sqrt(1.0 - xp.clip(corr, 0.0, 1.0) ** 2)
+    mask = mask_energy & (min_err < xp.inf)
+
+    # ---------------- Affine solve ----------------
+    denom = xp.sum(d_c * d_c, axis=2)
+    valid = denom > 1e-8
+    num = xp.sum(d_c * r_c[:, None, :], axis=2)
+    s = xp.zeros_like(denom)
+    s[valid] = num[valid] / denom[valid]
+    o = r_mean[:, 0] - s * d_mean[:, :, 0]
+
+    recon = s[:, :, None] * domains_sym + o[:, :, None]
+
+    # ---------------- Handle variable-length ranges with per-range weight ----------------
+    diff_list = []
+    for i in range(B):
+        N_i = ranges_list[i].shape[0]
+        weight_i = xp.linspace(1.0, 0.5, N_i, dtype=xp.float32)
+        recon_i = recon[i, :, :N_i]
+        r_i = ranges[i, :N_i][None, :]
+        diff_i = (recon_i - r_i) * weight_i[None, :]
+        # pad to max_N
+        diff_i_padded = xp.pad(diff_i, ((0,0),(0,max_N - N_i)), mode='constant')
+        diff_list.append(diff_i_padded)
+    diff = xp.stack(diff_list, axis=0)
+    err = xp.linalg.norm(diff, axis=2)
+    err = xp.where(mask[:, :, 0], err, xp.inf)
+
+    # ---------------- Select best ----------------
+    idx = xp.argmin(err, axis=1)
+    best_err = err[xp.arange(B), idx]
+    best_domain = domain_idxs_sym[xp.arange(B), idx]
+    best_s = xp.clip(s[xp.arange(B), idx], -abs(s_clip), abs(s_clip))
+    best_o = o[xp.arange(B), idx]
+    best_sym = sym_flags[xp.arange(B), idx]
+
+    mask_invalid = range_idxs < 0
+    if xp.any(mask_invalid):
+        best_domain[mask_invalid] = -1
+        best_s[mask_invalid] = 0.0
+        best_o[mask_invalid] = 0.0
+        best_sym[mask_invalid] = 0
+
+    # ---------------- Emit results ----------------
+    for i in range(B):
+        results_queue.put((
+            int(range_idxs[i]),
+            (
+                int(best_domain[i]),
+                float(best_s[i]),
+                float(best_o[i]),
+                int(best_sym[i]),
+                float(best_err[i])
+            )
+        ))
 
 
 # ----------------------- Symmetry -----------------------
@@ -727,58 +868,105 @@ def voiced_detection(signal, frame_size=64, energy_threshold=1e-4, smooth_window
 
 
 # ---------------- Top-level worker for multiprocessing ----------------
-def exact_affine_gpu(range_block, domain_idxs, domains_xp, sr=44100, 
-                     transient_weight=1.0, mel_weights=None, transient_mask=None):
-    """
-    Batched affine solve with perceptual weighting for one range and many candidate domains.
-    Compatible with CPU (numpy) or GPU (cupy) depending on domains_xp type.
-    Returns: (domain_idx, scale, offset, symmetry, error)
-    """
-    xp = cp.get_array_module(range_block)
+def exact_affine_gpu(
+    range_block,
+    domain_idxs,
+    domains_xp,
+    sr=44100,
+    transient_weight=1.0,
+    mel_weights=None,
+    transient_mask=None,
+):
+    # ---------------- Backend ----------------
+    xp = cp.get_array_module(range_block) if "cp" in globals() else np # type: ignore
+
     r = xp.asarray(range_block, dtype=xp.float32)
-    tiles = xp.asarray(domains_xp[domain_idxs], dtype=xp.float32)
-    tiles_m = tiles[:, ::-1]
+    tiles_base = xp.asarray(domains_xp[domain_idxs], dtype=xp.float32)
 
     range_size = r.shape[0]
 
-    # Use provided Mel weights and transient mask if given
+    # ---------------- Perceptual weights ----------------
     if mel_weights is None:
-        mel_weights = xp.linspace(1.0, 0.5, range_size).astype(xp.float32)
+        mel_weights = xp.linspace(1.0, 0.5, range_size, dtype=xp.float32)
+    else:
+        mel_weights = xp.asarray(mel_weights, dtype=xp.float32)
+
     if transient_mask is None:
         env = xp.abs(r[1:] - r[:-1])
         env = xp.pad(env, (0, 1))
     else:
-        env = transient_mask
+        env = xp.asarray(transient_mask, dtype=xp.float32)
+
+    weight = mel_weights * (1.0 + transient_weight * env)
+
+    # ---------------- Precompute range stats ----------------
+    r_mean = r.mean()
+    r_c = r - r_mean
+    r_energy = xp.sum(r_c * r_c)
+    r_norm = xp.sqrt(r_energy)
 
     best_err = xp.inf
-    best_result = None
+    best_idx = -1
+    best_s = 0.0
+    best_o = 0.0
+    best_sym = 0
 
-    for tiles_cur, sym in [(tiles, 0), (tiles_m, 1)]:
-        mean_d = tiles_cur.mean(axis=1)
-        d_c = tiles_cur - mean_d[:, None]
-        r_mean = r.mean()
-        r_c = r - r_mean
+    # ---------------- Symmetry loop ----------------
+    for sym in (0, 1):
+        tiles = tiles_base if sym == 0 else tiles_base[:, ::-1]
 
+        mean_d = tiles.mean(axis=1)
+        d_c = tiles - mean_d[:, None]
+
+        # ---------- ENERGY PRUNING ----------
+        d_energy = xp.sum(d_c * d_c, axis=1)
+        energy_ratio = d_energy / (r_energy + 1e-12)
+        valid_energy = (energy_ratio > 0.25) & (energy_ratio < 4.0)
+
+        if not xp.any(valid_energy):
+            continue
+
+        d_c = d_c[valid_energy]
+        tiles_v = tiles[valid_energy]
+        idxs_v = xp.asarray(domain_idxs)[valid_energy]
+        d_energy = d_energy[valid_energy]
+        d_norm = xp.sqrt(d_energy)
+
+        # ---------- CORRELATION UPPER BOUND PRUNING ----------
+        corr = xp.abs(xp.sum(d_c * r_c, axis=1)) / (r_norm * d_norm + 1e-12)
+        min_possible_err = r_norm * xp.sqrt(1.0 - xp.clip(corr, 0.0, 1.0) ** 2)
+
+        keep = min_possible_err < best_err
+        if not xp.any(keep):
+            continue
+
+        d_c = d_c[keep]
+        tiles_v = tiles_v[keep]
+        idxs_v = idxs_v[keep]
+        d_norm = d_norm[keep]
+
+        # ---------- AFFINE SOLVE ----------
         denom = xp.sum(d_c * d_c, axis=1)
         valid = denom > 1e-8
 
         s = xp.zeros_like(denom)
         s[valid] = xp.sum(d_c[valid] * r_c, axis=1) / denom[valid]
-        o = r_mean - s * mean_d
+        o = r_mean - s * tiles_v.mean(axis=1)
 
-        recon = s[:, None] * tiles_cur + o[:, None]
-
-        # perceptual error
-        weighted_diff = (recon - r) * mel_weights[None, :]
-        weighted_diff *= (1.0 + transient_weight * env[None, :])
-        err = xp.linalg.norm(weighted_diff, axis=1)
+        recon = s[:, None] * tiles_v + o[:, None]
+        diff = (recon - r) * weight[None, :]
+        err = xp.linalg.norm(diff, axis=1)
 
         i = int(xp.argmin(err))
         if err[i] < best_err:
             best_err = err[i]
-            best_result = (int(domain_idxs[i]), float(s[i]), float(o[i]), sym, float(err[i]))
+            best_idx = int(idxs_v[i])
+            best_s = float(s[i])
+            best_o = float(o[i])
+            best_sym = sym
 
-    return best_result
+    return best_idx, best_s, best_o, best_sym, float(best_err)
+
 
 def _process_range(idx, ranges, domains_path, domain_embs_path, n_domains, range_size, emb_dim=16, use_gpu=False, domains_gpu=None):
     """
@@ -812,20 +1000,24 @@ def _worker_batch(idx_slice, ranges, domains_path, domain_embs_path, n_domains, 
         results.append(res)
     return results
 
-def compress_audio(signal, framerate, sampwidth,
-                   tile_size=1024,
-                   emb_dim=16,
-                   top_k=top_k,
-                   ef_search=50,
-                   use_gpu=False,
-                   energy_thresh=1e-4,
-                   domains_tmpdir=None,
-                   batch_size=512,
-                   fast_mode=True,
-                   transient_weight=1.0,
-                   n_mels=40):
+def compress_audio(
+    signal,
+    framerate,
+    sampwidth,
+    tile_size=1024,
+    emb_dim=16,
+    top_k=top_k,
+    ef_search=50,
+    use_gpu=False,
+    energy_thresh=1e-4,
+    domains_tmpdir=None,
+    batch_size=512,
+    fast_mode=True,
+    transient_weight=1.0,
+    n_mels=40,
+):
     """
-    Compress audio using fractal domain matching with **pipeline parallelism**.
+    Compress audio using fractal domain matching with pipeline parallelism.
     CPU: candidate selection via embeddings
     GPU: exact affine solve in batches
     """
@@ -835,118 +1027,198 @@ def compress_audio(signal, framerate, sampwidth,
     domain_step = max(1, range_size // 4)
 
     # ---------------- Voiced detection ----------------
-    voiced_mask = voiced_detection(signal, frame_size=range_size*2, energy_threshold=energy_thresh)
+    voiced_mask = voiced_detection(
+        signal,
+        frame_size=range_size * 2,
+        energy_threshold=energy_thresh,
+    )
     weighted_signal = signal * voiced_mask
     original_len = len(weighted_signal)
 
-    if np.sum(weighted_signal**2) < 1e-8:
-        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, tile_size, domain_step, energy_thresh, original_len
+    # ---------- Short / silent audio ----------
+    if np.sum(weighted_signal ** 2) < 1e-8:
+        return (
+            [],
+            np.zeros((0, range_size), dtype=np.float32),
+            0,
+            range_size,
+            tile_size,
+            domain_step,
+            energy_thresh,
+            original_len,
+        )
 
     pad_len = (range_size - (original_len % range_size)) % range_size
     if pad_len:
-        weighted_signal = np.pad(weighted_signal, (0, pad_len), mode='reflect')
+        weighted_signal = np.pad(weighted_signal, (0, pad_len), mode="reflect")
 
     n_ranges = len(weighted_signal) // range_size
     if n_ranges == 0:
-        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, tile_size, domain_step, energy_thresh, original_len
+        return (
+            [],
+            np.zeros((0, range_size), dtype=np.float32),
+            0,
+            range_size,
+            tile_size,
+            domain_step,
+            energy_thresh,
+            original_len,
+        )
 
     ranges = weighted_signal.reshape(n_ranges, range_size)
 
-    # ---------------- Build domains (memmap) ----------------
-    domains_path, n_domains = build_domains_memmap(signal, tile_size, range_size, domain_step,
-                                                   block_size=500, tmpdir=domains_tmpdir,
-                                                   use_gpu=(use_gpu and GPU_WORKING))
-    if n_domains == 0:
-        return [], np.zeros((0, range_size), dtype=np.float32), 0, range_size, tile_size, domain_step, energy_thresh, original_len
+    # ---------------- Build domains ----------------
+    domains_path = None
+    emb_path = None
+    domains_array = None
 
-    domains_array = np.memmap(domains_path, dtype='float32', mode='r', shape=(n_domains, range_size))
-    domains_xp = xp.asarray(domains_array) if (use_gpu and GPU_WORKING) else domains_array
-
-    # ---------------- Build domain embeddings ----------------
-    emb_path = build_domain_embeddings(domains_path, n_domains, range_size, emb_dim=emb_dim,
-                                       block_size=4096, tmpdir=domains_tmpdir)
-
-    # ---------------- Build ANN index ----------------
-    ann_index_path = None
-    if n_domains > 4096 and HNSW_AVAILABLE:
-        ann_index_path = build_ann_index(emb_path, n_domains, emb_dim=emb_dim, method='hnsw',
-                                         ef=ef_search)
-        if ann_index_path:
-            logger.info(f'[FWAVC] Built HNSW ANN index at {ann_index_path} (ef={ef_search})')
-
-    # ---------------- Pipeline parallelism ----------------
-    manager = mp.Manager()
-    candidate_queue = manager.Queue(maxsize=64)
-    results_queue = manager.Queue()
-
-    num_cpu_workers = mp.cpu_count()
-    cpu_slices = np.array_split(np.arange(n_ranges), num_cpu_workers)
-
-    cpu_processes = [
-        mp.Process(
-            target=cpu_worker,
-            args=(
-                sl, ranges, emb_path, n_domains, range_size, emb_dim,
-                candidate_queue, ann_index_path, energy_thresh, fast_mode
-            )
-        )
-        for sl in cpu_slices
-    ]
-
-    n_fft = max(1024, range_size)
-    mel_fb = get_mel_filterbank(sr=framerate, n_fft=n_fft, n_mels=n_mels)
-    transient_masks = [compute_transient_mask(r) for r in ranges]
-
-    gpu_process = mp.Process(
-        target=gpu_worker,
-        kwargs={
-            'candidate_queue': candidate_queue,
-            'domains_path': domains_path,
-            'range_size': range_size,
-            'results_queue': results_queue,
-            'use_gpu': use_gpu and GPU_WORKING,
-            'batch_size': batch_size,
-            'num_cpu_workers': num_cpu_workers,
-            'transient_weight': transient_weight,
-            'n_mels': n_mels,
-            'mel_fb': mel_fb,
-            'transient_masks': transient_masks
-        }
-    )
-
-    # ---------------- Start processes ----------------
-    for p in cpu_processes:
-        p.start()
-    gpu_process.start()
-
-    # ---------------- Start processes ----------------
-    for p in cpu_processes:
-        p.start()
-    gpu_process.start()
-
-    # ---------------- Collect results ----------------
-    matches = [None] * n_ranges
-    finished = 0
-    while finished < n_ranges:
-        idx, res = results_queue.get()
-        matches[idx] = res
-        finished += 1
-
-    # Cleanup
-    for p in cpu_processes:
-        p.join()
-    gpu_process.join()
-
-    domains_array_cpu = np.asarray(domains_array)
-
-    # Remove temporary files
     try:
-        if domains_path: os.remove(domains_path)
-        if emb_path: os.remove(emb_path)
-    except Exception:
-        pass
+        domains_path, n_domains = build_domains_memmap(
+            signal,
+            tile_size,
+            range_size,
+            domain_step,
+            block_size=500,
+            tmpdir=domains_tmpdir,
+            use_gpu=(use_gpu and GPU_WORKING),
+        )
 
-    return matches, domains_array_cpu, n_ranges, range_size, tile_size, domain_step, energy_thresh, original_len
+        if n_domains == 0:
+            return (
+                [],
+                np.zeros((0, range_size), dtype=np.float32),
+                0,
+                range_size,
+                tile_size,
+                domain_step,
+                energy_thresh,
+                original_len,
+            )
+
+        domains_array = np.memmap(
+            domains_path,
+            dtype="float32",
+            mode="r",
+            shape=(n_domains, range_size),
+        )
+        domains_xp = (
+            xp.asarray(domains_array)
+            if (use_gpu and GPU_WORKING)
+            else domains_array
+        )
+
+        # ---------------- Embeddings ----------------
+        emb_path = build_domain_embeddings(
+            domains_path,
+            n_domains,
+            range_size,
+            emb_dim=emb_dim,
+            block_size=4096,
+            tmpdir=domains_tmpdir,
+        )
+
+        # ---------------- ANN index ----------------
+        ann_index_path = None
+        if n_domains > 4096 and HNSW_AVAILABLE:
+            ann_index_path = build_ann_index(
+                emb_path,
+                n_domains,
+                emb_dim=emb_dim,
+                method="hnsw",
+                ef=ef_search,
+            )
+
+        # ---------------- Pipeline parallelism ----------------
+        manager = mp.Manager()
+        candidate_queue = manager.Queue(maxsize=64)
+        results_queue = manager.Queue()
+
+        num_cpu_workers = mp.cpu_count()
+        cpu_slices = np.array_split(np.arange(n_ranges), num_cpu_workers)
+
+        cpu_processes = [
+            mp.Process(
+                target=cpu_worker,
+                args=(
+                    sl,
+                    ranges,
+                    emb_path,
+                    n_domains,
+                    range_size,
+                    emb_dim,
+                    candidate_queue,
+                    ann_index_path,
+                    energy_thresh,
+                    fast_mode,
+                ),
+            )
+            for sl in cpu_slices
+        ]
+
+        n_fft = max(1024, range_size)
+        mel_fb = get_mel_filterbank(
+            sr=framerate, n_fft=n_fft, n_mels=n_mels
+        )
+        transient_masks = [compute_transient_mask(r) for r in ranges]
+
+        gpu_process = mp.Process(
+            target=gpu_worker,
+            kwargs={
+                "candidate_queue": candidate_queue,
+                "domains_path": domains_path,
+                "range_size": range_size,
+                "results_queue": results_queue,
+                "use_gpu": use_gpu and GPU_WORKING,
+                "batch_size": batch_size,
+                "num_cpu_workers": num_cpu_workers,
+                "transient_weight": transient_weight,
+                "n_mels": n_mels,
+                "mel_fb": mel_fb,
+                "transient_masks": transient_masks,
+            },
+        )
+
+        # ---------------- Start processes (ONCE) ----------------
+        for p in cpu_processes:
+            p.start()
+        gpu_process.start()
+
+        # ---------------- Collect results ----------------
+        matches = [None] * n_ranges
+        finished = 0
+        while finished < n_ranges:
+            idx, res = results_queue.get()
+            matches[idx] = res
+            finished += 1
+
+        return (
+            matches,
+            np.asarray(domains_array),
+            n_ranges,
+            range_size,
+            tile_size,
+            domain_step,
+            energy_thresh,
+            original_len,
+        )
+
+    finally:
+        # ---------------- Cleanup ----------------
+        for p in getattr(locals(), "cpu_processes", []):
+            if p.is_alive():
+                p.join()
+
+        if "gpu_process" in locals() and gpu_process.is_alive():
+            gpu_process.join()
+
+        try:
+            if domains_path:
+                os.remove(domains_path)
+            if emb_path:
+                os.remove(emb_path)
+        except Exception:
+            pass
+
 
 # ---------------- save/load compressed ----------------
 
