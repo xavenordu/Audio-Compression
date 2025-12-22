@@ -221,9 +221,17 @@ def correlation_upper_bound(r_c, d_c, r_norm, d_norm):
 
 def frame_ranges(signal, range_size, hop=None):
     hop = hop or range_size
-    total = len(signal)
-    ranges = [signal[i:i+range_size] for i in range(0, total-range_size+1, hop)]
-    return np.vstack(ranges) if ranges else np.empty((0, range_size), dtype=signal.dtype)
+    signal = np.asarray(signal)
+    total = signal.shape[0]
+    
+    if total < range_size:
+        return np.empty((0, range_size), dtype=signal.dtype)
+    
+    num_frames = 1 + (total - range_size) // hop
+    shape = (num_frames, range_size)
+    strides = (signal.strides[0]*hop, signal.strides[0])
+    
+    return np.lib.stride_tricks.as_strided(signal, shape=shape, strides=strides)
 
 # ----------------------- Domain memmap building -----------------------
 
@@ -825,17 +833,21 @@ def _process_gpu_batch(
     best_sym = to_numpy(best_sym)
     best_err = to_numpy(best_err)
 
-    for i in range(B):
-        results_queue.put((
-            int(range_idxs[i]),
-            (
-                int(best_domain[i]),
-                float(best_s[i]),
-                float(best_o[i]),
-                int(best_sym[i]),
-                float(best_err[i])
-            )
-        ))
+    # Build all results at once
+    batch_results = list(zip(
+        range_idxs.tolist(),
+        zip(
+            best_domain.tolist(),
+            best_s.tolist(),
+            best_o.tolist(),
+            best_sym.tolist(),
+            best_err.tolist()
+        )
+    ))
+
+    # Push to queue
+    for item in batch_results:
+        results_queue.put(item)
 
 def _flush_gpu_batch(batch, ranges, domains_xp, results_queue, use_gpu, s_clip=16.0):
     xp = cp if (use_gpu and "cp" in globals() and GPU_WORKING) else np
@@ -1041,10 +1053,12 @@ def compress_audio(
     use_gpu=False,
     energy_thresh=1e-4,
     domains_tmpdir=None,
-    batch_size=512,
+    batch_size_gpu=512,
+    batch_size_cpu=128,
     fast_mode=True,
     transient_weight=1.0,
     n_mels=40,
+    cpu_workers=None,
 ):
     """
     Compress audio using fractal domain matching with pipeline parallelism.
@@ -1129,8 +1143,7 @@ def compress_audio(
             domains_path,
             dtype="float32",
             mode="r",
-            shape=(n_domains, range_size),
-        )
+            shape=(n_domains, range_size))
         domains_xp = (
             xp.asarray(domains_array)
             if (use_gpu and GPU_WORKING)
@@ -1163,8 +1176,10 @@ def compress_audio(
         candidate_queue = mp.Queue(maxsize=64)
         results_queue = mp.Queue()
 
-        num_cpu_workers = mp.cpu_count()
-        cpu_slices = np.array_split(np.arange(n_ranges), num_cpu_workers)
+        # num_cpu_workers = mp.cpu_count() 
+        if cpu_workers is None:
+            cpu_workers = max(1, mp.cpu_count() // 2)
+        cpu_slices = np.array_split(np.arange(n_ranges), cpu_workers)
 
         cpu_processes = [
             mp.Process(
@@ -1185,7 +1200,7 @@ def compress_audio(
                     ann_index_path=ann_index_path,
                     energy_thresh=energy_thresh,
                     fast_mode=fast_mode,
-                    batch_size=batch_size,
+                    batch_size=batch_size_cpu,
                 ),
             )
             for sl in cpu_slices
@@ -1207,8 +1222,8 @@ def compress_audio(
                 "range_size": range_size,
                 "results_queue": results_queue,
                 "use_gpu": use_gpu and GPU_WORKING,
-                "batch_size": batch_size,
-                "num_cpu_workers": num_cpu_workers,
+                "batch_size": batch_size_gpu,
+                "num_cpu_workers": cpu_workers,
                 "transient_weight": transient_weight,
                 "n_mels": n_mels,
                 "mel_fb": mel_fb,
